@@ -1,6 +1,7 @@
 
 use std::collections::HashMap;
 use std::panic;
+use std::fmt;
 
 type ByteArray = Box<[u8]>;
 
@@ -8,7 +9,7 @@ type ByteArray = Box<[u8]>;
 pub enum BencodeValue {
     Integer {value: i64},
     String {value: ByteArray},
-    List {elements: Vec<BencodeValue>},
+    List {elements: Box<[BencodeValue]>},
     Dictionary {items: HashMap<ByteArray, Box<BencodeValue>>},
 }
 
@@ -17,6 +18,29 @@ pub struct BencodeParser {
     contents: ByteArray,
     pos: usize,
     length: usize
+}
+
+impl fmt::Display for BencodeValue {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        return match self {
+            BencodeValue::Integer { value } => write!(f, "{}", value),
+            BencodeValue::String { value } => write!(f, "{}", byte_array_to_string(value)),
+            BencodeValue::List { elements } => {
+                let s: Vec<std::string::String> = elements.iter().map(|e| e.to_string()).collect();
+                return write!(f, "[{}]", s.join("\n"));
+            },
+            BencodeValue::Dictionary { items } => {
+                let s: Vec<std::string::String> = items.iter().map(|pair| byte_array_to_string(pair.0) + " => " + &pair.1.to_string()).collect();
+                return write!(f, "{{{}}}", s.join("\n"));
+            },
+        };
+    }
+}
+
+fn byte_array_to_string(slice: &Box<[u8]>) -> std::string::String {
+    let v: Vec<char> = slice.iter().map(|e| char::from(*e)).collect();
+    let s: std::string::String = v.into_iter().collect();
+    return s;
 }
 
 impl BencodeParser {
@@ -38,14 +62,13 @@ impl BencodeParser {
             panic!("no further values");
         }
         let first: u8 = self.contents[self.pos];
-        let x: BencodeValue = match first {
+        return match first {
             b'i' => self.parse_integer(),
             b'l' => self.parse_list(),
             b'd' => self.parse_dictionary(),
             b'1'..=b'9' => self.parse_string(),
             _ => panic!("unknown type specificer {}", first),
         };
-        return x;
     }
 
     fn verify_pos(&self, addend: Option<usize>) {
@@ -58,7 +81,7 @@ impl BencodeParser {
         }
     }
 
-    fn parse_integer_value(&mut self) -> u64 {
+    fn parse_integer_value(&mut self) -> i64 {
         self.verify_pos(None);
         if self.contents[self.pos] == b'0' {
             self.verify_pos(Some(1));
@@ -77,10 +100,10 @@ impl BencodeParser {
             }
             self.pos += 1;
         }
-        let mut place: u64 = 1;
-        let mut value: u64 = 0;
+        let mut place: i64 = 1;
+        let mut value: i64 = 0;
         for digit in digits.iter().rev() {
-            value += place * (*digit as u64);
+            value += place * i64::from(*digit);
             place *= 10;
         }
         return value;
@@ -100,7 +123,10 @@ impl BencodeParser {
             sign = -1;
             self.pos += 1;
         }
-        let value: i64 = self.parse_integer_value() as i64;
+        let value: i64 = i64::from(self.parse_integer_value());
+        if value == 0 && sign == -1 {
+            panic!("negative zero is not allowed")
+        }
         if self.contents[self.pos] != b'e' {
             panic!("integers must end with 'e'")
         }
@@ -120,8 +146,7 @@ impl BencodeParser {
             values.push(self.parse_helper());
         }
         self.pos += 1;
-        return BencodeValue::List { elements: values };
-
+        return BencodeValue::List { elements: values.into_boxed_slice() };
     }
 
     fn parse_dictionary(&mut self) -> BencodeValue {
@@ -132,15 +157,27 @@ impl BencodeParser {
         self.pos += 1;
         self.verify_pos(None);
         let mut map: HashMap<ByteArray, Box<BencodeValue>> = HashMap::new();
+        let mut last_added: Option<ByteArray> = None;
         while self.contents[self.pos] != b'e' {
             self.verify_pos(None);
             let key: BencodeValue = self.parse_string();
-            let b: ByteArray = match key {
+            let b = match key {
                 BencodeValue::String { value } => value,
                 _ => panic!("dictionary keys must be strings"),
             };
+            if map.contains_key(&b) {
+                panic!("dictionary keys must be unique");
+            }
+            match last_added {
+                Some(arr) => if b < arr {
+                    panic!("dictionary keys must appear in order");
+                },
+                None => (),
+            };
+            last_added = Some(b.clone());
             let value: Box<BencodeValue> = Box::new(self.parse_helper());
             map.insert(b, value);
+
         }
         self.pos += 1;
         return BencodeValue::Dictionary { items: map };
@@ -148,20 +185,24 @@ impl BencodeParser {
 
     fn parse_string(&mut self) -> BencodeValue {
         self.verify_pos(None);
-        let length: usize = self.parse_integer_value() as usize;
+        let return_value: i64 = self.parse_integer_value();
+        if return_value < 0 {
+            panic!("strings cannot have negative lengths");
+        }
         self.verify_pos(None);
         if self.contents[self.pos] != b':' {
-            println!("pos {} = {}", self.pos, self.contents[self.pos] as char);
             panic!("':' expected to separate string length from string contents")
         }
         self.pos += 1;
         let mut s: String = String::new();
+        let length: u64 = return_value.unsigned_abs();
         for _ in 0..length {
             self.verify_pos(None);
-            s.push(self.contents[self.pos] as char);
+            s.push(char::from(self.contents[self.pos]));
             self.pos += 1;
         }
         return BencodeValue::String { value: Box::from(s.as_bytes()) };
     }
+
 }
 

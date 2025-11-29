@@ -7,10 +7,10 @@ type ByteArray = Box<[u8]>;
 
 #[derive(Debug)]
 pub enum BencodeValue {
-    Integer {value: i64},
-    String {value: ByteArray},
-    List {elements: Box<[BencodeValue]>},
-    Dictionary {items: HashMap<ByteArray, Box<BencodeValue>>},
+    Integer(i64),
+    String(std::string::String),
+    List(Vec<BencodeValue>),
+    Dictionary(HashMap<std::string::String, Box<BencodeValue>>),
 }
 
 #[derive(Debug)]
@@ -23,24 +23,18 @@ pub struct BencodeParser {
 impl fmt::Display for BencodeValue {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         return match self {
-            BencodeValue::Integer { value } => write!(f, "{}", value),
-            BencodeValue::String { value } => write!(f, "{}", byte_array_to_string(value)),
-            BencodeValue::List { elements } => {
+            BencodeValue::Integer(num) => write!(f, "{}", num),
+            BencodeValue::String(text) => write!(f, "{}", text),
+            BencodeValue::List(elements) => {
                 let s: Vec<std::string::String> = elements.iter().map(|e| e.to_string()).collect();
                 return write!(f, "[{}]", s.join("\n"));
             },
-            BencodeValue::Dictionary { items } => {
-                let s: Vec<std::string::String> = items.iter().map(|pair| byte_array_to_string(pair.0) + " => " + &pair.1.to_string()).collect();
+            BencodeValue::Dictionary(items ) => {
+                let s: Vec<std::string::String> = items.iter().map(|pair| pair.0.to_owned() + " => " + &pair.1.to_string()).collect();
                 return write!(f, "{{{}}}", s.join("\n"));
             },
         };
     }
-}
-
-fn byte_array_to_string(slice: &Box<[u8]>) -> std::string::String {
-    let v: Vec<char> = slice.iter().map(|e| char::from(*e)).collect();
-    let s: std::string::String = v.into_iter().collect();
-    return s;
 }
 
 impl BencodeParser {
@@ -131,7 +125,7 @@ impl BencodeParser {
             panic!("integers must end with 'e'")
         }
         self.pos += 1;
-        return BencodeValue::Integer{value: sign * value};
+        return BencodeValue::Integer(sign * value);
     }
 
     fn parse_list(&mut self) -> BencodeValue {
@@ -146,7 +140,7 @@ impl BencodeParser {
             values.push(self.parse_helper());
         }
         self.pos += 1;
-        return BencodeValue::List { elements: values.into_boxed_slice() };
+        return BencodeValue::List(values);
     }
 
     fn parse_dictionary(&mut self) -> BencodeValue {
@@ -156,13 +150,13 @@ impl BencodeParser {
         }
         self.pos += 1;
         self.verify_pos(None);
-        let mut map: HashMap<ByteArray, Box<BencodeValue>> = HashMap::new();
-        let mut last_added: Option<ByteArray> = None;
+        let mut map: HashMap<std::string::String, Box<BencodeValue>> = HashMap::new();
+        let mut last_added: Option<std::string::String> = None;
         while self.contents[self.pos] != b'e' {
             self.verify_pos(None);
             let key: BencodeValue = self.parse_string();
             let b = match key {
-                BencodeValue::String { value } => value,
+                BencodeValue::String (text ) => text,
                 _ => panic!("dictionary keys must be strings"),
             };
             if map.contains_key(&b) {
@@ -180,7 +174,7 @@ impl BencodeParser {
 
         }
         self.pos += 1;
-        return BencodeValue::Dictionary { items: map };
+        return BencodeValue::Dictionary(map);
     }
 
     fn parse_string(&mut self) -> BencodeValue {
@@ -201,7 +195,7 @@ impl BencodeParser {
             s.push(char::from(self.contents[self.pos]));
             self.pos += 1;
         }
-        return BencodeValue::String { value: Box::from(s.as_bytes()) };
+        return BencodeValue::String(s);
     }
 
 }

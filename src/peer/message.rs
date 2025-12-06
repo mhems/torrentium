@@ -55,23 +55,6 @@ impl TryFrom<u8> for MessageId {
         }
     }
 }
-/*
-impl From<&Message> for MessageId {
-    fn from(message: &Message) -> Self {
-        match message {
-            Message::Choke => MessageId::Choke,
-            Message::Unchoke => MessageId::Unchoke,
-            Message::Interested => MessageId::Interested,
-            Message::NotInterested => MessageId::NotInterested,
-            Message::Have { .. } => MessageId::Have,
-            Message::Bitfield { .. } => MessageId::Bitfield,
-            Message::Request { .. } => MessageId::Request,
-            Message::Piece { .. } => MessageId::Piece,
-            Message::Cancel { .. } => MessageId::Cancel,
-        }
-    }
-}
-*/
 
 impl Message {
     pub async fn read_message(stream: &mut TcpStream) -> Result<Self, MessageError> {
@@ -82,15 +65,19 @@ impl Message {
         if total_length == 0 {
             return Ok(Message::KeepAlive)
         }
-        let payload_length = total_length - 1;
+
         let mut id_buf: [u8; 1] = [0; 1];
         Message::read_bytes(stream, &mut id_buf).await?;
-        let id = MessageId::try_from(id_buf[0])?;
+        let id: MessageId = MessageId::try_from(id_buf[0])?;
 
+        let payload_length = total_length - 1;
         match id {
             MessageId::Bitfield => Message::read_bitfield(stream, payload_length).await,
             MessageId::Piece => Message::read_piece(stream, payload_length).await,
-            _ => Message::read_fixed_message(stream, id, payload_length).await,
+            MessageId::Have => Message::read_have(stream, payload_length).await,
+            MessageId::Request => Message::read_12(stream, true, payload_length).await,
+            MessageId::Cancel => Message::read_12(stream, false, payload_length).await,
+            _ => Message::read_zero(stream, id, payload_length).await,
         }
     }
 
@@ -122,14 +109,6 @@ impl Message {
             return Err(MessageError::UnexpectedNumBytes { expected: buf.len(), received: num_read });
         }
         Ok(())
-    }
-
-    async fn read_fixed_message(stream: &mut TcpStream, id: MessageId, payload_length: usize) -> Result<Self, MessageError> {
-        match id {
-            MessageId::Have => Message::read_have(stream, payload_length).await,
-            MessageId::Request | MessageId::Cancel => Message::read_12(stream, id == MessageId::Request, payload_length).await,
-            _ => Message::read_zero(stream, id, payload_length).await,
-        }
     }
 
     async fn read_have(stream: &mut TcpStream, payload_length: usize) -> Result<Self, MessageError> {

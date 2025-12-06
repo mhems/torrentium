@@ -1,6 +1,21 @@
 [package]
-name = "torrent"
+name = "torrentium"
 version = "0.1.0"
 edition = "2024"
+authors = ["Matt Hems"]
+description = "tools for parsing, inspecting and downloading BitTorrent files"
+license = "MIT"
 
 [dependencies]
+url = "2.5.7"
+percent-encoding = "2.3.2"
+reqwest = "0.12"
+tokio = "1.28"
+
+[[bin]]
+name = "torrent"
+path = "src/main.rs"
+
+[lib]
+name = "torrent"
+

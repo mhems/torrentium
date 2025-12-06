@@ -1,8 +1,10 @@
 use std::collections::BTreeMap;
 use std::fmt;
+use url::Url;
+use percent_encoding::{percent_encode, NON_ALPHANUMERIC};
 
 use crate::sha1;
-use crate::bencode::BencodeValue;
+use crate::metadata::bencode::BencodeValue;
 
 #[derive(Debug)]
 pub struct TorrentFile {
@@ -49,6 +51,8 @@ pub enum TorrentError {
     InvalidNumberOfPieces(usize),
     InvalidAnnounceListElement,
     InvalidString(Vec<u8>),
+    InvalidAnnounceUrl(String),
+    MultipleFilesUnsupported
 }
 
 type Result<T> = std::result::Result<T, TorrentError>;
@@ -239,7 +243,7 @@ impl TorrentFile {
         }
     }
 
-    fn extract_uint(value: Option<&BencodeValue>, name: &'static str, mandatory: bool) -> Result<Option<u64>> {
+    pub(crate) fn extract_uint(value: Option<&BencodeValue>, name: &'static str, mandatory: bool) -> Result<Option<u64>> {
         match value {
             Some(v) => {
                 match v {
@@ -348,4 +352,27 @@ impl TorrentFile {
         }
     }
 
+    pub fn get_announce_url(&self, peer_id: &[u8;20], port: u16) -> Result<Url> {
+        let mut url = Url::parse(&self.announce)
+            .map_err(|_| TorrentError::InvalidAnnounceUrl(self.announce.to_string()))?;
+
+        let encoded_hash = percent_encode(self.hash.as_slice(), NON_ALPHANUMERIC).to_string();
+        let encoded_id = percent_encode(peer_id, NON_ALPHANUMERIC).to_string();
+
+        let length = match &self.info {
+            FileModeInfo::Single { length, .. } => length,
+            FileModeInfo::Multiple { .. } => return Err(TorrentError::MultipleFilesUnsupported),
+        };
+
+        url.query_pairs_mut()
+            .append_pair("info_hash", &encoded_hash)
+            .append_pair("peer_id", &encoded_id)
+            .append_pair("port", &port.to_string())
+            .append_pair("uploaded", "0")
+            .append_pair("downloaded", "0")
+            .append_pair("compact", "1")
+            .append_pair("left", &length.to_string());
+
+        Ok(url)
+    }
 }

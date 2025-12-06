@@ -78,13 +78,13 @@ impl Message {
         let mut buf: [u8; 4] = [0; 4];
         Message::read_bytes(stream, &mut buf).await?;
 
-        let payload_length = usize::from_be_bytes(buf[0..4].try_into().map_err(|_| MessageError::ByteConversionError)?);
-        if payload_length == 0 {
+        let total_length = usize::from_be_bytes(buf[0..4].try_into().map_err(|_| MessageError::ByteConversionError)?);
+        if total_length == 0 {
             return Ok(Message::KeepAlive)
         }
-
+        let payload_length = total_length - 1;
         let mut id_buf: [u8; 1] = [0; 1];
-        Message::read_bytes(stream, &mut id_buf);
+        Message::read_bytes(stream, &mut id_buf).await?;
         let id = MessageId::try_from(id_buf[0])?;
 
         match id {

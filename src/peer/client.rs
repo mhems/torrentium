@@ -1,24 +1,39 @@
+use core::fmt;
 use std::result::Result;
 use std::net::{SocketAddrV4};
 
 use reqwest::get;
+use tokio::task::JoinError;
 
 use crate::peer::PEER_ID;
 use crate::metadata::file::{TorrentError, TorrentFile};
 use crate::metadata::bencode::{BencodeValue, BencodeError};
+use crate::peer::message::MessageError;
+use crate::peer::downloader::DownloadError;
 
+#[derive(Debug, Clone)]
 pub struct TrackerResponse {
-    interval: u64,
-    peers: Vec<SocketAddrV4>,
+    pub interval: u64,
+    pub peers: Vec<SocketAddrV4>,
 }
 
+#[derive(Debug)]
 pub enum ProtocolError {
     InvalidAnnounceUrl,
     NoTrackerResponse(reqwest::Error),
     NoTrackerResponseBody(reqwest::Error),
     InvalidTrackerResponse(TrackerError),
+    ReadError(MessageError),
+    WriteError(MessageError),
+    ConnectionError(std::io::Error),
+    HandshakeError(DownloadError),
+    Timeout,
+    ConversionError,
+    JoinError(JoinError),
+    DiskError(tokio::io::Error),
 }
 
+#[derive(Debug)]
 pub enum TrackerError {
     NonBencodedTrackerResponse(BencodeError),
     TrackerResponseNotADictionary,
@@ -85,10 +100,20 @@ impl TryFrom<&BencodeValue> for TrackerResponse {
     }
 }
 
+impl fmt::Display for TrackerResponse {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "Interval (s): {}\n", self.interval)?;
+        for (i, socket) in self.peers.iter().enumerate() {
+            write!(f, "{:03}: {}\n", i, socket)?;
+        }
+        Ok(())
+    }
+}
+
 pub async fn retrieve_peers(file: &TorrentFile, port: u16) -> Result<TrackerResponse, ProtocolError> {
     let url = file.get_announce_url(PEER_ID, port)
         .map_err(|_| ProtocolError::InvalidAnnounceUrl)?;
-    
+        
     let response = get(url).await.map_err(|e| ProtocolError::NoTrackerResponse(e))?;
     let response_bytes: &[u8] = &response.bytes().await.map_err(|e| ProtocolError::NoTrackerResponseBody(e))?;
 

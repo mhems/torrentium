@@ -1,29 +1,50 @@
+use std::fs;
+
+use clap::Parser;
+
 use torrent::metadata::bencode::BencodeValue;
 use torrent::metadata::file::TorrentFile;
+use torrent::peer::download_file;
 
-fn main() {
+#[derive(Parser, Debug)]
+#[command(name="torrentium")]
+struct Args {
+    #[arg(short, long)]
+    file: String,
 
-    let contents : &[u8] = 
-        "d8:announce41:http://bttracker.debian.org:6969/announce7:comment35:\"Debian CD from cdimage.debian.org\"13:creation datei1573903810e9:httpseedsl145:https://cdimage.debian.org/cdimage/release/10.2.0//srv/cdbuilder.debian.org/dst/deb-cd/weekly-builds/amd64/iso-cd/debian-10.2.0-amd64-netinst.iso145:https://cdimage.debian.org/cdimage/archive/10.2.0//srv/cdbuilder.debian.org/dst/deb-cd/weekly-builds/amd64/iso-cd/debian-10.2.0-amd64-netinst.isoe4:infod6:lengthi351272960e4:name31:debian-10.2.0-amd64-netinst.iso12:piece lengthi262144eee"
-        .as_bytes();
-    println!("\nparsing Bencoded value...");
-    let result = BencodeValue::try_from(contents);
-    match &result {
-        Ok(value) => {
-            println!("parsed Bencoded value:\n{}", &value);
+    #[arg(short, long)]
+    port: u16,
 
-            let encoded: Vec<u8> = Vec::from(value);
-            assert_eq!(contents, encoded);
+    #[arg(short, long)]
+    num_seeds: usize
+}
 
-            println!("\nconverting Bencoded value to torrent file...");
-            match TorrentFile::try_from(value) {
-                Ok(torrent) => {
-                    println!("torrent file:\n{}", &torrent)
+#[tokio::main]
+async fn main() {
+    let args = Args::parse();
+    let filename = args.file;
+    match fs::read(&filename) {
+        Ok(contents) => {
+            match BencodeValue::try_from(contents.as_slice()) {
+                Ok(value) => {
+                    match TorrentFile::try_from(&value) {
+                        Ok(torrent) => {
+                            println!("contents of {}:\n{}", &filename, &torrent);
+
+                            if let Err(e) = download_file(&torrent, args.port, args.num_seeds).await {
+                                println!("error downloading file {}: {:?}", &filename, e);
+                            }
+                        },
+                        Err(e) => {
+                            println!("unrecognized Torrent file {:?}", e);
+                        }
+                    }
                 },
-                Err(e) => println!("{:?}", e)
+                Err(e) => {
+                    println!("unable to parse into Bencoded value: {:?}", e)
+                }
             }
         },
-        Err(e) => println!("{:?}", e),
-    };
-
+        Err(e) => println!("unable to read file {}: {:?}", &filename, e),
+    }
 }

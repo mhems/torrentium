@@ -1,12 +1,13 @@
 use std::collections::BTreeMap;
 use std::fmt;
+use std::sync::Arc;
 use url::Url;
 use percent_encoding::{percent_encode, NON_ALPHANUMERIC};
 
 use crate::sha1;
 use crate::metadata::bencode::BencodeValue;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct TorrentFile {
     announce: String,
     announce_list: Vec<Vec<String>>,
@@ -15,20 +16,22 @@ pub struct TorrentFile {
     created_by: Option<String>,
     encoding: Option<String>,
 
-    info: FileModeInfo,
-    num_bytes_per_piece: u64,
-    piece_hashes: Vec<[u8; 20]>,
-    hash: [u8; 20],
+    pub info: Arc<FileModeInfo>,
+    pub total_num_bytes: u64,
+    pub num_bytes_per_piece: u64,
+    pub num_pieces: usize,
+    pub piece_hashes: Arc<Vec<[u8; 20]>>,
+    pub hash: Arc<[u8; 20]>,
     private: bool,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum FileModeInfo {
     Single {filename: String, length: u64, md5sum: Option<[u8; 16]>},
     Multiple {directory: String, files: Vec<MultiFileInfo>},
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct MultiFileInfo {
     length: u64,
     md5sum: Option<[u8; 16]>,
@@ -52,7 +55,8 @@ pub enum TorrentError {
     InvalidAnnounceListElement,
     InvalidString(Vec<u8>),
     InvalidAnnounceUrl(String),
-    MultipleFilesUnsupported
+    MultipleFilesUnsupported,
+    LengthMismatch(u64, u64),
 }
 
 type Result<T> = std::result::Result<T, TorrentError>;
@@ -97,8 +101,8 @@ impl fmt::Display for TorrentFile {
             writeln!(f, "encoding: {}", e)?;
         }
         writeln!(f, "private: {}", self.private)?;
-        let num_pieces = (self.piece_hashes.len() / 20) as u64;
-        writeln!(f, "size: {} bytes ({} pieces of {} bytes each)", self.num_bytes_per_piece * num_pieces, num_pieces, self.num_bytes_per_piece)?;
+        writeln!(f, "num hashes: {}", self.piece_hashes.len())?;
+        writeln!(f, "size: {} bytes ({} pieces of {} bytes each)", self.total_num_bytes, self.num_pieces, self.num_bytes_per_piece)?;
         writeln!(f, "file(s): {}", self.info)
     }
 }
@@ -158,11 +162,13 @@ impl TorrentFile {
             comment: None,
             created_by: None,
             encoding: None,
+            total_num_bytes: 0,
             num_bytes_per_piece: 0,
-            piece_hashes: Vec::new(),
-            hash: [0; 20],
+            num_pieces: 0,
+            piece_hashes: Arc::new(Vec::new()),
+            hash: Arc::new([0; 20]),
             private: false,
-            info: info
+            info: Arc::new(info)
         }
     }
 
@@ -185,13 +191,18 @@ impl TorrentFile {
             self.private = false;
         }
         self.extract_pieces(info_items.get(PIECES))?;
-        self.hash = sha1::sha1_hash(Vec::from(items.get(INFO).unwrap()).as_slice());
+        self.num_pieces = self.piece_hashes.len();
+        self.total_num_bytes = self.num_pieces as u64 * self.num_bytes_per_piece;
+        self.hash = Arc::new(sha1::sha1_hash(Vec::from(items.get(INFO).unwrap()).as_slice()));
         let name = Self::extract_string(info_items.get(NAME), "name", true)?.unwrap();
-        match &self.info {
+        match self.info.as_ref() {
             FileModeInfo::Single{..} => {
                 let length = Self::extract_uint(info_items.get(LENGTH), "length", true)?.unwrap();
+                if length != self.total_num_bytes {
+                    return Err(TorrentError::LengthMismatch(length, self.total_num_bytes))
+                };
                 let md5sum = Self::extract_md5sum(info_items.get(MD5SUM))?;
-                self.info = FileModeInfo::Single { filename: name, length: length, md5sum: md5sum };
+                self.info = Arc::new(FileModeInfo::Single { filename: name, length: length, md5sum: md5sum });
             },
             FileModeInfo::Multiple {..} => {
                 let mut files = Vec::new();
@@ -216,7 +227,7 @@ impl TorrentFile {
                 if files.is_empty() {
                     return Err(TorrentError::KeyMapsToAnEmptyList("files"))
                 }
-                self.info = FileModeInfo::Multiple { directory: name, files: files };
+                self.info = Arc::new(FileModeInfo::Multiple { directory: name, files: files });
             },
         }
         Ok(())
@@ -340,9 +351,11 @@ impl TorrentFile {
                         if length % 20 != 0 {
                             return Err(TorrentError::InvalidNumberOfPieces(length))
                         }
+                        let mut tmp: Vec<[u8; 20]> = Vec::with_capacity(length/20);
                         for chunk in s.chunks_exact(20) {
-                            self.piece_hashes.push(chunk.try_into().unwrap());
+                            tmp.push(chunk.try_into().unwrap());
                         }
+                        self.piece_hashes = Arc::new(tmp);
                         Ok(())
                     },
                     _ => Err(TorrentError::KeyDoesNotMapToString("pieces"))
@@ -359,20 +372,22 @@ impl TorrentFile {
         let encoded_hash = percent_encode(self.hash.as_slice(), NON_ALPHANUMERIC).to_string();
         let encoded_id = percent_encode(peer_id, NON_ALPHANUMERIC).to_string();
 
-        let length = match &self.info {
+        let length = match &self.info.as_ref() {
             FileModeInfo::Single { length, .. } => length,
             FileModeInfo::Multiple { .. } => return Err(TorrentError::MultipleFilesUnsupported),
         };
 
         url.query_pairs_mut()
-            .append_pair("info_hash", &encoded_hash)
-            .append_pair("peer_id", &encoded_id)
             .append_pair("port", &port.to_string())
             .append_pair("uploaded", "0")
             .append_pair("downloaded", "0")
             .append_pair("compact", "1")
             .append_pair("left", &length.to_string());
 
-        Ok(url)
+        let new_url_str = format!("{}&info_hash={}&peer_id={}", url, encoded_hash, encoded_id);
+        let new_url = Url::parse(&new_url_str)
+            .map_err(|_| TorrentError::InvalidAnnounceUrl(new_url_str))?;
+
+        Ok(new_url)
     }
 }

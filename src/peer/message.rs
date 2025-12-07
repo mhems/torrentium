@@ -1,6 +1,9 @@
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
+use std::array::TryFromSliceError;
 use std::io::Error;
+
+use crate::Bitfield;
 
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -16,6 +19,7 @@ pub enum MessageId {
     Cancel        = 8,
 }
 
+#[derive(Debug)]
 pub enum Message {
     KeepAlive,
     Choke,
@@ -23,17 +27,19 @@ pub enum Message {
     Interested,
     NotInterested,
     Have { index: u32 },
-    Bitfield { bitmap: Vec<u8> },
+    Bitfield { bitmap: Bitfield },
     Request { index: u32, begin: u32, length: u32 },
     Piece { index: u32, begin: u32, bytes: Vec<u8> },
     Cancel { index: u32, begin: u32, length: u32 },
 }
 
+#[derive(Debug)]
 pub enum MessageError {
     UnknownMessage,
     ReceiveError(Error),
     TransmitError(Error),
     ByteConversionError,
+    DetailedByteConversionError(TryFromSliceError),
     UnexpectedNumBytes{expected: usize, received: usize},
 }
 
@@ -61,7 +67,8 @@ impl Message {
         let mut buf: [u8; 4] = [0; 4];
         Message::read_bytes(stream, &mut buf).await?;
 
-        let total_length = usize::from_be_bytes(buf[0..4].try_into().map_err(|_| MessageError::ByteConversionError)?);
+        let total_length = u32::from_be_bytes(buf[0..4].try_into().map_err(|e| MessageError::DetailedByteConversionError(e))?);
+                
         if total_length == 0 {
             return Ok(Message::KeepAlive)
         }
@@ -69,8 +76,8 @@ impl Message {
         let mut id_buf: [u8; 1] = [0; 1];
         Message::read_bytes(stream, &mut id_buf).await?;
         let id: MessageId = MessageId::try_from(id_buf[0])?;
+        let payload_length = total_length as usize - 1;
 
-        let payload_length = total_length - 1;
         match id {
             MessageId::Bitfield => Message::read_bitfield(stream, payload_length).await,
             MessageId::Piece => Message::read_piece(stream, payload_length).await,
@@ -92,7 +99,7 @@ impl Message {
             return Err(MessageError::UnexpectedNumBytes { expected: 8, received: bytes.len() });
         }
         let index: u32 = u32::from_be_bytes(bytes[0..4].try_into().map_err(|_| MessageError::ByteConversionError)?);
-        let begin: u32 = u32::from_be_bytes(bytes[5..8].try_into().map_err(|_| MessageError::ByteConversionError)?);
+        let begin: u32 = u32::from_be_bytes(bytes[4..8].try_into().map_err(|_| MessageError::ByteConversionError)?);
         bytes.drain(0..8);
         Ok(Message::Piece{index, begin, bytes})
     }
@@ -104,11 +111,7 @@ impl Message {
     }
 
     async fn read_bytes(stream: &mut TcpStream, buf: &mut[u8]) -> Result<(), MessageError> {
-        let num_read = stream.read_exact(buf).await.map_err(|e| MessageError::ReceiveError(e))?;
-        if num_read < buf.len() {
-            return Err(MessageError::UnexpectedNumBytes { expected: buf.len(), received: num_read });
-        }
-        Ok(())
+        stream.read_exact(buf).await.map(|_| ()).map_err(|e| MessageError::ReceiveError(e))
     }
 
     async fn read_have(stream: &mut TcpStream, payload_length: usize) -> Result<Self, MessageError> {
@@ -124,7 +127,7 @@ impl Message {
         Message::read_bytes(stream, &mut buf).await?;
         Message::consume(stream, payload_length, 12).await?;
         let index = u32::from_be_bytes(buf[0..4].try_into().map_err(|_| MessageError::ByteConversionError)?);
-        let begin = u32::from_be_bytes(buf[5..8].try_into().map_err(|_| MessageError::ByteConversionError)?);
+        let begin = u32::from_be_bytes(buf[4..8].try_into().map_err(|_| MessageError::ByteConversionError)?);
         let length = u32::from_be_bytes(buf[8..12].try_into().map_err(|_| MessageError::ByteConversionError)?);
         if request {
             Ok(Message::Request { index, begin, length })
@@ -151,7 +154,6 @@ impl Message {
             let extra = payload_length - expected;
             let mut buf = vec![0; extra];
             stream.read_exact(&mut buf).await.map_err(|e| MessageError::ReceiveError(e))?;
-            return Err(MessageError::UnexpectedNumBytes { expected, received: payload_length })
         }
         Ok(())
     }
@@ -180,7 +182,7 @@ impl Message {
     pub async fn send_bitfield(stream: &mut TcpStream, bitmap: &[u8]) -> Result<(), MessageError> {
         let mut buf = vec![0; 4 + 1 + bitmap.len()];
         Message::encode_header(MessageId::Bitfield, 1 + bitmap.len() as u32, &mut buf);
-        buf[5..].copy_from_slice(bitmap.iter().as_slice());
+        buf[5..].copy_from_slice(&bitmap);
         Message::send_bytes(stream, &buf).await
     }
 
@@ -189,12 +191,12 @@ impl Message {
         Message::encode_header(MessageId::Piece, 1 + 8 + data.len() as u32, &mut buf);
         buf[5..9].copy_from_slice(index.to_be_bytes().as_slice());
         buf[9..13].copy_from_slice(begin.to_be_bytes().as_slice());
-        buf[13..].copy_from_slice(data.iter().as_slice());
+        buf[13..].copy_from_slice(data);
         Message::send_bytes(stream, &buf).await
     }
 
     pub async fn send_have(stream: &mut TcpStream, index: u32) -> Result<(), MessageError> {
-        let mut buf: [u8; 5] = [0; 5];
+        let mut buf: [u8; 9] = [0; 9];
         Message::encode_header(MessageId::Have, 1 + 4, &mut buf);
         buf[5..9].copy_from_slice(index.to_be_bytes().as_slice());
         Message::send_bytes(stream, &buf).await
@@ -213,7 +215,8 @@ impl Message {
     }
 
     fn encode_12(request: bool, index: u32, begin: u32, length: u32, buf: &mut[u8]) {
-        Message::encode_header(if request { MessageId::Request} else { MessageId::Cancel }, 13, buf);
+        let id = if request { MessageId::Request} else { MessageId::Cancel };
+        Message::encode_header(id, 13, buf);
         buf[5..9].copy_from_slice(index.to_be_bytes().as_slice());
         buf[9..13].copy_from_slice(begin.to_be_bytes().as_slice());
         buf[13..17].copy_from_slice(length.to_be_bytes().as_slice());
@@ -221,7 +224,7 @@ impl Message {
 
     fn encode_header(id: MessageId, length: u32, buf: &mut[u8]) {
         buf[0..4].copy_from_slice(length.to_be_bytes().as_slice());
-        buf[5] = id as u8;
+        buf[4] = id as u8;
     }
 
     async fn send_header(stream: &mut TcpStream, id: MessageId) -> Result<(), MessageError> {

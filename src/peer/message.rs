@@ -3,7 +3,7 @@ use tokio::net::TcpStream;
 use std::array::TryFromSliceError;
 use std::io::Error;
 
-use crate::Bitfield;
+use crate::peer::Bitfield;
 
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -27,7 +27,7 @@ pub enum Message {
     Interested,
     NotInterested,
     Have { index: u32 },
-    Bitfield { bitmap: Bitfield },
+    Bitfield { bitfield: Bitfield },
     Request { index: u32, begin: u32, length: u32 },
     Piece { index: u32, begin: u32, bytes: Vec<u8> },
     Cancel { index: u32, begin: u32, length: u32 },
@@ -89,8 +89,8 @@ impl Message {
     }
 
     async fn read_bitfield(stream: &mut TcpStream, payload_length: usize) -> Result<Self, MessageError> {
-        let bitmap = Message::read_variable_message(stream, payload_length).await?;
-        Ok(Message::Bitfield { bitmap })
+        let bitfield = Message::read_variable_message(stream, payload_length).await?;
+        Ok(Message::Bitfield{ bitfield: Bitfield::from(bitfield) })
     }
 
     async fn read_piece(stream: &mut TcpStream, payload_length: usize) -> Result<Self, MessageError> {

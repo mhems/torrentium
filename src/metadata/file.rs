@@ -64,8 +64,14 @@ type Result<T> = std::result::Result<T, TorrentError>;
 impl fmt::Display for FileModeInfo {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
-            FileModeInfo::Single{filename, length, ..} => {
-                write!(f, "{} ({} bytes)", filename, length)
+            FileModeInfo::Single{filename, length, md5sum} => {
+                write!(f, "{} ({} bytes", filename, length)?;
+                if let Some(sum) = md5sum {
+                    write!(f, ", md5 present)")?;
+                } else {
+                    write!(f, ")")?;
+                }
+                Ok(())
             },
             FileModeInfo::Multiple { directory, files } => {
                 let file_list = files

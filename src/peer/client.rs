@@ -31,6 +31,7 @@ pub enum ProtocolError {
     ConversionError,
     JoinError(JoinError),
     DiskError(tokio::io::Error),
+    Exhausted,
 }
 
 #[derive(Debug)]

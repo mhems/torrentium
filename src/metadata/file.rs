@@ -4,7 +4,7 @@ use std::sync::Arc;
 use url::Url;
 use percent_encoding::{percent_encode, NON_ALPHANUMERIC};
 
-use crate::sha1;
+use crate::util::sha1::sha1_hash;
 use crate::metadata::bencode::BencodeValue;
 
 #[derive(Debug, Clone)]
@@ -16,12 +16,12 @@ pub struct TorrentFile {
     created_by: Option<String>,
     encoding: Option<String>,
 
-    pub info: Arc<FileModeInfo>,
+    pub info: FileModeInfo,
     pub total_num_bytes: u64,
     pub num_bytes_per_piece: u64,
     pub num_pieces: usize,
-    pub piece_hashes: Arc<Vec<[u8; 20]>>,
-    pub hash: Arc<[u8; 20]>,
+    pub piece_hashes: Vec<[u8; 20]>,
+    pub hash: [u8; 20],
     private: bool,
 }
 
@@ -171,10 +171,10 @@ impl TorrentFile {
             total_num_bytes: 0,
             num_bytes_per_piece: 0,
             num_pieces: 0,
-            piece_hashes: Arc::new(Vec::new()),
-            hash: Arc::new([0; 20]),
+            piece_hashes: Vec::new(),
+            hash: [0; 20],
             private: false,
-            info: Arc::new(info)
+            info: info
         }
     }
 
@@ -199,16 +199,16 @@ impl TorrentFile {
         self.extract_pieces(info_items.get(PIECES))?;
         self.num_pieces = self.piece_hashes.len();
         self.total_num_bytes = self.num_pieces as u64 * self.num_bytes_per_piece;
-        self.hash = Arc::new(sha1::sha1_hash(Vec::from(items.get(INFO).unwrap()).as_slice()));
+        self.hash = sha1_hash(Vec::from(items.get(INFO).unwrap()).as_slice());
         let name = Self::extract_string(info_items.get(NAME), "name", true)?.unwrap();
-        match self.info.as_ref() {
+        match self.info {
             FileModeInfo::Single{..} => {
                 let length = Self::extract_uint(info_items.get(LENGTH), "length", true)?.unwrap();
                 if length != self.total_num_bytes {
                     return Err(TorrentError::LengthMismatch(length, self.total_num_bytes))
                 };
                 let md5sum = Self::extract_md5sum(info_items.get(MD5SUM))?;
-                self.info = Arc::new(FileModeInfo::Single { filename: name, length: length, md5sum: md5sum });
+                self.info = FileModeInfo::Single { filename: name, length: length, md5sum: md5sum };
             },
             FileModeInfo::Multiple {..} => {
                 let mut files = Vec::new();
@@ -233,7 +233,7 @@ impl TorrentFile {
                 if files.is_empty() {
                     return Err(TorrentError::KeyMapsToAnEmptyList("files"))
                 }
-                self.info = Arc::new(FileModeInfo::Multiple { directory: name, files: files });
+                self.info = FileModeInfo::Multiple { directory: name, files: files };
             },
         }
         Ok(())
@@ -361,7 +361,7 @@ impl TorrentFile {
                         for chunk in s.chunks_exact(20) {
                             tmp.push(chunk.try_into().unwrap());
                         }
-                        self.piece_hashes = Arc::new(tmp);
+                        self.piece_hashes = tmp;
                         Ok(())
                     },
                     _ => Err(TorrentError::KeyDoesNotMapToString("pieces"))
@@ -378,7 +378,7 @@ impl TorrentFile {
         let encoded_hash = percent_encode(self.hash.as_slice(), NON_ALPHANUMERIC).to_string();
         let encoded_id = percent_encode(peer_id, NON_ALPHANUMERIC).to_string();
 
-        let length = match &self.info.as_ref() {
+        let length = match &self.info {
             FileModeInfo::Single { length, .. } => length,
             FileModeInfo::Multiple { .. } => return Err(TorrentError::MultipleFilesUnsupported),
         };

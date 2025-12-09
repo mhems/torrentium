@@ -3,12 +3,14 @@ mod handshake;
 mod message;
 mod downloader;
 
-use std::sync::Arc;
+use std::{path::{PathBuf}, sync::Arc};
 
-use crate::{metadata::file::{FileModeInfo::{Multiple, Single}, TorrentFile}, peer::downloader::{FileDownloadInfo, FileDownloadState}};
+use crate::{metadata::file::{FileModeInfo::{Multiple, Single}, TorrentFile}, peer::{client::ProtocolError, downloader::{FileDownloadInfo, FileDownloadState}}, util};
 use crate::peer::{client::retrieve_peers, downloader::Downloader};
 
 pub use downloader::DownloadError;
+
+use tempfile::TempDir;
 use tokio::sync::Mutex;
 
 const PEER_ID: &[u8; 20] = b"!MySuperCoolTorrent!";
@@ -27,17 +29,22 @@ impl From<Vec<u8>> for Bitfield {
     }
 }
 
+pub enum BitfieldError {
+    Unrepresentible{num_fields: usize, num_elements: usize},
+    PieceOutOfRange{index: usize, len: usize},
+}
+
 impl Bitfield {
     pub fn new(num: usize, set: bool) -> Self {
         let num_elements = num.div_ceil(8);
-        let masks = if set { vec![1; num_elements] } else { vec![0; num_elements] };
+        let masks = if set { vec![0xFF; num_elements] } else { vec![0; num_elements] };
         Bitfield { masks, num, last_mask: 0xFF}
     }
 
-    pub fn from_vec(v: Vec<u8>, num: usize) -> Self {
+    pub fn try_from_vec(v: Vec<u8>, num: usize) -> Result<Self, BitfieldError> {
         let num_elements = num.div_ceil(8);
         if v.len() < num_elements {
-            panic!("cannot represent a Bitfield with {} fields in a vector with {} elements", num, v.len());
+            return Err(BitfieldError::Unrepresentible { num_fields: num, num_elements: v.len() });
         }
         let extra = num_elements % 8;
         let last_mask: u8 = if extra != 0 { ((1 << extra) - 1) << (8 - extra) } else { 0xFF };
@@ -47,37 +54,41 @@ impl Bitfield {
                 *last &= last_mask;
             }
         }
-        bf
+        Ok(bf)
     }
 
-    fn index_check(&self, index: usize) {
+    fn index_check(&self, index: usize) -> Result<(), BitfieldError> {
         if index >= self.num {
-            panic!("Bitfield only represents {} fields", self.num);
+            Err(BitfieldError::PieceOutOfRange { index, len: self.num })
+        } else {
+            Ok(())
         }
     }
 
-    pub fn has_piece(&self, index: usize) -> bool {
-        self.index_check(index);
+    pub fn has_piece(&self, index: usize) -> Result<bool, BitfieldError> {
+        self.index_check(index)?;
         let element_index = index / 8;
         let element_offset = index % 8;
         let mask = 1 << (7 - element_offset);
-        self.masks[element_index] & mask == mask
+        Ok(self.masks[element_index] & mask == mask)
     }
     
-    pub fn mark_piece(&mut self, index: usize) {
-        self.index_check(index);
+    pub fn mark_piece(&mut self, index: usize) -> Result<(), BitfieldError> {
+        self.index_check(index)?;
         let element_index = index / 8;
         let element_offset = index % 8;
         let mask = 1 << (7 - element_offset);
         self.masks[element_index] |= mask;
+        Ok(())
     }
 
-    pub fn ummark_piece(&mut self, index: usize) {
-        self.index_check(index);
+    pub fn ummark_piece(&mut self, index: usize) -> Result<(), BitfieldError> {
+        self.index_check(index)?;
         let element_index = index / 8;
         let element_offset = index % 8;
         let mask = 1 << (7 - element_offset);
         self.masks[element_index] &= !mask;
+        Ok(())
     }
 
     pub fn num_set(&self) -> usize {
@@ -102,9 +113,8 @@ impl Bitfield {
     }
 }
 
-
 pub async fn download(file: &TorrentFile, port: u16, num_seeds: usize) -> Result<(), DownloadError> {
-    match &file.info.as_ref() {
+    match &file.info {
         Single { .. } => download_file(file, port, num_seeds).await?,
         Multiple { directory, files } => {
             panic!("multiple files currently not supported");
@@ -114,7 +124,7 @@ pub async fn download(file: &TorrentFile, port: u16, num_seeds: usize) -> Result
 }
 
 pub async fn download_file(file: &TorrentFile, port: u16, num_seeds: usize) -> Result<(), DownloadError> {
-    match file.info.as_ref() {
+    match &file.info {
         Single {filename, .. } => {
             let tracker_response = retrieve_peers(file, port).await
                 .map_err(|_| DownloadError::RetrievalError)?;
@@ -122,28 +132,41 @@ pub async fn download_file(file: &TorrentFile, port: u16, num_seeds: usize) -> R
             println!("using {} seeds (of {})", n, tracker_response.peers.len());
 
             let mut tasks = Vec::with_capacity(n);
-            let filename_arc: Arc<String> = Arc::new(filename.into());
+            
+            let path = PathBuf::from(filename);
+            let stem = path.file_stem().unwrap().to_string_lossy();
+
+            let dir = TempDir::new().map_err(|e| DownloadError::FileSystemError(e))?;
+            let dir_path = dir.path().to_path_buf();
+
+            println!("temp dir is {}", dir_path.to_string_lossy());
+
+            let basename = stem.as_ref().to_string();
+            let basename_arc = Arc::new(basename);
 
             let info = FileDownloadInfo::try_from(file)?;
-            let info_arc = Arc::new(info);
+            let info_arc: Arc<FileDownloadInfo> = Arc::new(info);
 
             let state = FileDownloadState::new(file.num_pieces);
-
             let state_arc = Arc::new(Mutex::new(state));
 
             for i in 0..n {
                 let peer_clone = tracker_response.peers[i].clone();
                 let info_clone = info_arc.clone();
                 let state_clone = state_arc.clone();
+                let dir_clone = dir_path.clone();
+                let basename_clone = basename_arc.clone();
                 
-                println!("spawning task to download '{}' from {}", filename_arc, peer_clone);
+                println!("spawning task to download '{}' from {}", filename, peer_clone);
 
                 tasks.push(tokio::spawn(async move {
                     let mut downloader = Downloader::new(
                         peer_clone,
                         info_clone,
-                        state_clone
-                    );
+                        state_clone,
+                        dir_clone,
+                        basename_clone
+                    ).await.map_err(|e| ProtocolError::ConnectionError(e))?;
                     downloader.download_file().await
                 }));
             }
@@ -155,6 +178,13 @@ pub async fn download_file(file: &TorrentFile, port: u16, num_seeds: usize) -> R
                     Err(e) => println!("[{}]: error with join: {:?}", tracker_response.peers[i], e),
                 }
             }
+
+            let paths: Vec<PathBuf> = (0..file.num_pieces)
+                .map(|i| dir_path.join(format!("{}.{}.bin", stem, i)))
+                .collect();
+
+            util::io::concatenate_pieces(&paths, path)
+                .map_err(|e| DownloadError::FileSystemError(e))?;
         },
         Multiple { directory, files } => {
             panic!("multiple files currently not supported");

@@ -1,5 +1,4 @@
 use std::collections::HashSet;
-use std::path::Path;
 use std::net::SocketAddrV4;
 use std::sync::Arc;
 
@@ -7,39 +6,40 @@ use tokio::net::TcpStream;
 use tokio::fs::File;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::Mutex;
+use std::path::{Path, PathBuf};
 
 use crate::metadata::file::{FileModeInfo, TorrentFile};
 use crate::peer::Bitfield;
 use crate::peer::handshake::handshake;
 use crate::peer::{client::ProtocolError, message::{Message, MessageError}};
-use crate::sha1::sha1_hash;
+use crate::util::sha1::sha1_hash;
 
 const BLOCK_SIZE: u32 = 16 * 1024;
 
 #[derive(Debug)]
 pub struct Downloader {
     pub address: SocketAddrV4,
-    pub connection: Option<TcpStream>,
+    connection: TcpStream,
     info: Arc<FileDownloadInfo>,
     shared_state: Arc<Mutex<FileDownloadState>>,
     skip_set: HashSet<u32>,
     state: State,
+    basename: Arc<String>,
+    dir: PathBuf,
 }
 
 #[derive(Debug, Clone)]
 pub struct FileDownloadInfo {
     num_pieces: u64,
     bytes_per_piece: usize,
-    length: u64,
-    filename: Arc<String>,
-    piece_hashes: Arc<Vec<[u8; 20]>>,
-    hash: Arc<[u8; 20]>,
+    piece_hashes: Vec<[u8; 20]>,
+    hash: [u8; 20],
 }
 
 #[derive(Debug)]
 pub struct FileDownloadState {
-    pub(crate) done: Bitfield,
-    pub(crate) todo: HashSet<u32>,
+    done: Bitfield,
+    todo: HashSet<u32>,
 }
 
 #[derive(Debug)]
@@ -50,7 +50,6 @@ struct PieceDownloadProgress {
 
 #[derive(Debug)]
 pub enum DownloadError {
-    NotConnected,
     CannotDownloadMultipleFiles,
     InvalidHandshakeLength(usize),
     InvalidProtocolIdLength(u8),
@@ -63,19 +62,18 @@ pub enum DownloadError {
     MismatchedHash([u8; 20], [u8; 20]),
     MismatchedPeerId([u8; 20], [u8; 20]),
     RetrievalError,
-    Message
+    Message,
+    FileSystemError(std::io::Error)
 }
 
 impl TryFrom<&TorrentFile> for FileDownloadInfo {
     type Error = DownloadError;
     fn try_from(file: &TorrentFile) -> Result<Self, DownloadError> {
-        match file.info.as_ref() {
-            FileModeInfo::Single { filename, .. } => {
+        match &file.info {
+            FileModeInfo::Single { .. } => {
                 Ok(FileDownloadInfo {
                     num_pieces: file.num_pieces as u64,
                     bytes_per_piece: file.num_bytes_per_piece as usize,
-                    length: file.total_num_bytes,
-                    filename: Arc::new(filename.clone()),
                     piece_hashes: file.piece_hashes.clone(),
                     hash: file.hash.clone(),
                 })
@@ -122,7 +120,7 @@ impl PieceDownloadProgress {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Copy, Clone)]
 enum State {
     Curious, // waiting to see what pieces peer offers (via BitField response)
     Interested, // confirmed peer offers all pieces, waiting for unchoke response
@@ -133,86 +131,35 @@ enum State {
 }
 
 impl Downloader {
-    pub fn new(address: SocketAddrV4,
+    pub async fn new(address: SocketAddrV4,
                info: Arc<FileDownloadInfo>,
-               state: Arc<Mutex<FileDownloadState>>
-               ) -> Self {
-        Downloader { address, connection: None, info, shared_state: state, skip_set: HashSet::new(), state: State::Curious }
-    }
-
-    async fn connect(&mut self) -> std::io::Result<()> {
-        self.connection = Some(TcpStream::connect(self.address).await?);
-        Ok(())
+               state: Arc<Mutex<FileDownloadState>>,
+               dir: PathBuf,
+               basename: Arc<String>
+               ) -> std::io::Result<Self> {
+        Ok(Downloader {
+            address,
+            connection: TcpStream::connect(address).await?,
+            info,
+            shared_state: state,
+            skip_set: HashSet::new(),
+            state: State::Curious,
+            dir,
+            basename
+        })
     }
 
     async fn handshake(&mut self) -> Result<(), DownloadError> {
-        if let Some(stream) = self.connection.as_mut() {
-            handshake(stream, &self.info.hash).await
-        } else {
-            Err(DownloadError::NotConnected)
-        }
+        handshake( &mut self.connection, &self.info.hash).await
     }
 
     async fn get_message(&mut self) -> Result<Message, ProtocolError> {
-        let stream= self.connection.as_mut().unwrap();
-        Message::read_message(stream).await.map_err(|e| ProtocolError::ReadError(e))
-    }
-
-    async fn try_download_piece(&mut self) -> Result<(), ProtocolError> {
-        let piece = {
-            let mut guard = self.shared_state.lock().await;
-            println!("[{}]: {:.4}% to go", self.address, (guard.todo.len() as f32)*100.0 / (self.info.num_pieces as f32));
-            let mut candidates = guard.todo.difference(&self.skip_set);
-            if let Some(value) = candidates.next().cloned() {
-                guard.todo.remove(&value);
-                value
-            } else {
-                println!("[{}]: exhausted", self.address);
-                return Err(ProtocolError::Exhausted);
-            }
-        };
-
-        let result = {
-            let stream= self.connection.as_mut().unwrap();
-            Downloader::download_piece(stream, piece, self.info.bytes_per_piece)
-                .await
-                .map_err(|e| ProtocolError::ReadError(e))
-        };
-
-        match result {
-            Ok(data) => {
-                let data_hash = sha1_hash(&data);
-                if data_hash == self.info.piece_hashes[piece as usize] {
-                    println!(">>>> [{}]: DOWNLOADED ALL OF PIECE {} AND IT MATCHES!", self.address, piece);
-                    self.save_piece(piece, &data).await.map_err(|e| ProtocolError::DiskError(e))?;
-                    {
-                        let mut guard = self.shared_state.lock().await;
-                        if guard.done.has_piece(piece as usize) {
-                            println!("collision on {}", piece);
-                            std::process::exit(1);
-                        }
-                        guard.complete(piece);
-                    }
-                } else {
-                    println!(">>>> [{}]: DOWNLOADED ALL OF PIECE {} BUT IT DOESN'T MATCH!", self.address, piece);
-                    self.skip_set.insert(piece);
-                    self.shared_state.lock().await.requeue(piece);
-                }
-            },
-            Err(e) => {
-                println!(">>>> [{}] took error {:?}", self.address, e);
-                self.skip_set.insert(piece);
-                self.shared_state.lock().await.requeue(piece);
-                self.state = State::Choked;
-            }
-        }
-        Ok(())
+        Message::read_message(&mut self.connection)
+            .await
+            .map_err(|e| ProtocolError::ReadError(e))
     }
 
     pub async fn download_file(self: &mut Self) -> Result<(), ProtocolError> {
-        self.connect().await.map_err(|e| ProtocolError::ConnectionError(e))?;
-        println!("...connected to {}!", self.address);
-
         self.handshake().await.map_err(|e| ProtocolError::HandshakeError(e))?;
         println!("...handshaked with {}!", self.address);
 
@@ -220,13 +167,11 @@ impl Downloader {
         let bitfield_len = (num_pieces + 7) / 8;
         let empty = vec![0u8; bitfield_len];
 
-        {
-            let stream= self.connection.as_mut().unwrap();
-            Message::send_bitfield(stream, &empty).await.map_err(|e| ProtocolError::WriteError(e))?;
-        }
-
+        Message::send_bitfield(&mut self.connection, &empty)
+            .await
+            .map_err(|e| ProtocolError::WriteError(e))?;
+    
         self.state = State::Curious;
-        let mut interested = false;
 
         loop {
             match self.state {
@@ -235,10 +180,10 @@ impl Downloader {
                     let msg = self.get_message().await?;
                     if let Message::Bitfield { bitfield } = msg {
                         if bitfield.all() {
-                            let stream= self.connection.as_mut().unwrap();
                             self.state = State::Interested;
-                            interested = true;
-                            Message::send_interested(stream).await.map_err(|e| ProtocolError::WriteError(e))?;
+                            Message::send_interested(&mut self.connection)
+                                .await
+                                .map_err(|e| ProtocolError::WriteError(e))?;
                             println!("[{}]: interest expressed", self.address);
                         } else {
                             self.state = State::NotInterested;
@@ -263,6 +208,51 @@ impl Downloader {
             }
         }
 
+        Ok(())
+    }
+
+    async fn try_download_piece(&mut self) -> Result<(), ProtocolError> {
+        let piece = {
+            let mut guard = self.shared_state.lock().await;
+            println!("[{}]: {:.4}% to go", self.address, (guard.todo.len() as f32) * 100.0 / (self.info.num_pieces as f32));
+
+            if let Some(&p) = guard.todo.iter().find(|&&p| !self.skip_set.contains(&p)) {
+                guard.todo.remove(&p);
+                p
+            } else {
+                println!("[{}]: exhausted", self.address);
+                return Err(ProtocolError::Exhausted);
+            }
+        };
+
+        let result = Downloader::download_piece(&mut self.connection, piece, self.info.bytes_per_piece)
+                .await
+                .map_err(|e| ProtocolError::ReadError(e));
+
+        match result {
+            Ok(data) => {
+                let data_hash = sha1_hash(&data);
+                if data_hash == self.info.piece_hashes[piece as usize] {
+                    Downloader::save_piece(&self.dir, &self.basename, piece, &data)
+                            .await
+                            .map_err(|e| ProtocolError::DiskError(e))?;
+                    let mut guard = self.shared_state.lock().await;
+                    guard.complete(piece);
+                } else {
+                    println!(">>>> [{}]: DOWNLOADED ALL OF PIECE {} BUT HASHES MIS-MATCH!", self.address, piece);
+                    self.skip_set.insert(piece);
+                    let mut guard = self.shared_state.lock().await;
+                    guard.requeue(piece);
+                }
+            },
+            Err(e) => {
+                println!(">>>> [{}] took error {:?}", self.address, e);
+                self.skip_set.insert(piece);
+                let mut guard = self.shared_state.lock().await;
+                guard.requeue(piece);
+                self.state = State::Choked;
+            }
+        }
         Ok(())
     }
 
@@ -293,10 +283,8 @@ impl Downloader {
         Ok(progress.data)
     }
 
-    async fn save_piece(&self, piece: u32, bytes: &[u8]) -> tokio::io::Result<()> {
-        let path = Path::new(self.info.filename.as_ref());
-        let base = path.file_stem().unwrap().to_string_lossy();
-        let path = format!("{}.{}.bin", base, piece.to_string());
+    async fn save_piece(dir: &Path, basename: &str, piece: u32, bytes: &[u8]) -> tokio::io::Result<()> {
+        let path = dir.join(format!("{}.{}.bin", basename, piece));
         let mut file = File::create(path).await?;
         file.write_all(bytes).await?;
         Ok(())

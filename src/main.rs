@@ -23,6 +23,7 @@ struct Args {
 async fn main() {
     let args = Args::parse();
     let filename = args.file;
+
     match fs::read(&filename) {
         Ok(contents) => {
             match BencodeValue::try_from(contents.as_slice()) {

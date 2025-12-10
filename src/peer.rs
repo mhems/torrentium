@@ -3,10 +3,11 @@ mod handshake;
 mod message;
 mod downloader;
 
-use std::{path::{PathBuf}, sync::Arc};
+use std::{path::{PathBuf}, sync::Arc, fs};
 
-use crate::{metadata::file::{FileModeInfo::{Multiple, Single}, TorrentFile}, peer::{client::ProtocolError, downloader::{FileDownloadInfo, FileDownloadState}}, util};
-use crate::peer::{client::retrieve_peers, downloader::Downloader};
+use crate::metadata::file::{FileModeInfo::{Multiple, Single}, TorrentFile};
+use crate::peer::{client::{ProtocolError, retrieve_peers}, downloader::{FileDownloadInfo, FileDownloadState, Downloader}};
+use crate::util::{self, md5::md5_hash};
 
 pub use downloader::DownloadError;
 
@@ -29,6 +30,7 @@ impl From<Vec<u8>> for Bitfield {
     }
 }
 
+#[derive(Debug)]
 pub enum BitfieldError {
     Unrepresentible{num_fields: usize, num_elements: usize},
     PieceOutOfRange{index: usize, len: usize},
@@ -125,7 +127,7 @@ pub async fn download(file: &TorrentFile, port: u16, num_seeds: usize) -> Result
 
 pub async fn download_file(file: &TorrentFile, port: u16, num_seeds: usize) -> Result<(), DownloadError> {
     match &file.info {
-        Single {filename, .. } => {
+        Single {filename, length: _, md5sum } => {
             let tracker_response = retrieve_peers(file, port).await
                 .map_err(|_| DownloadError::RetrievalError)?;
             let n = num_seeds.min(tracker_response.peers.len());
@@ -183,12 +185,23 @@ pub async fn download_file(file: &TorrentFile, port: u16, num_seeds: usize) -> R
                 .map(|i| dir_path.join(format!("{}.{}.bin", stem, i)))
                 .collect();
 
-            util::io::concatenate_pieces(&paths, path)
+            util::io::concatenate_pieces(&paths, &path)
                 .map_err(|e| DownloadError::FileSystemError(e))?;
+
+            if let Some(expected_hash) = md5sum {
+                let bytes = fs::read(&path).map_err(DownloadError::FileSystemError)?;
+                let downloaded_hash = md5_hash(&bytes);
+                if downloaded_hash == *expected_hash {
+                    Ok(())
+                } else {
+                    Err(DownloadError::Md5Mismatch)
+                }
+            } else {
+                Ok(())
+            }
         },
         Multiple { directory, files } => {
             panic!("multiple files currently not supported");
         }
-    };
-    Ok(())
+    }
 }

@@ -63,7 +63,8 @@ pub enum DownloadError {
     MismatchedPeerId([u8; 20], [u8; 20]),
     RetrievalError,
     Message,
-    FileSystemError(std::io::Error)
+    FileSystemError(std::io::Error),
+    Md5Mismatch,
 }
 
 impl TryFrom<&TorrentFile> for FileDownloadInfo {
@@ -92,7 +93,7 @@ impl FileDownloadState {
     }
 
     pub fn complete(&mut self, piece_index: u32) {
-        self.done.mark_piece(piece_index as usize);
+        self.done.mark_piece(piece_index as usize).unwrap();
     }
 
     pub fn requeue(&mut self, piece_index: u32) {

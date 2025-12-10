@@ -1,3 +1,4 @@
+use crate::util::{from_ints, pad_bytes, to_ints};
 
 const H0: u32 = 0x67452301;
 const H1: u32 = 0xEFCDAB89;
@@ -6,15 +7,7 @@ const H3: u32 = 0x10325476;
 const H4: u32 = 0xC3D2E1F0;
 
 pub fn sha1_hash(bytes: &[u8]) -> [u8; 20] {
-    let n = bytes.len() as u64;
-    let message_length: u64 = n * 8;
-    let mut message: Vec<u8> = bytes.to_vec();
-    message.reserve(1 + 63 + 8);
-    message.push(0x80);
-    while (message.len() * 8) % 512 != 448 {
-        message.push(0);
-    };
-    message.extend(message_length.to_be_bytes());
+    let message = pad_bytes(bytes, true);
 
     let mut h0 = H0;
     let mut h1 = H1;
@@ -23,10 +16,8 @@ pub fn sha1_hash(bytes: &[u8]) -> [u8; 20] {
     let mut h4 = H4;
 
     for chunk in message.chunks_exact(64) {
-        let mut w: [u32; 80] = [0; 80];
-        for i in 0..16 {
-            w[i] = u32::from_be_bytes(chunk[i*4..i*4+4].try_into().unwrap());
-        }
+        let mut w: [u32; 80] = to_ints::<80>(chunk, true).unwrap();
+
         for i in 16..80 {
             w[i] = (w[i-3] ^ w[i-8] ^ w[i-14] ^ w[i-16]).rotate_left(1);
         }
@@ -63,9 +54,5 @@ pub fn sha1_hash(bytes: &[u8]) -> [u8; 20] {
         h4 = h4.wrapping_add(e);
     };
 
-    let mut hash: [u8; 20] = [0; 20];
-    for (i, word) in [h0, h1, h2, h3, h4].iter().enumerate() {
-        hash[i*4..(i+1)*4].copy_from_slice(&word.to_be_bytes());
-    }
-    hash
+    from_ints::<5, 20>([h0, h1, h2, h3, h4], true).unwrap()
 }

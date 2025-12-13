@@ -1,10 +1,13 @@
+use std::fmt;
+use std::net::SocketAddrV4;
 use std::result::Result;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
-use crate::peer::PEER_ID;
-use crate::peer::downloader::DownloadError;
+use crate::PEER_ID;
+use crate::metadata::bencode::{write_byte_string, write_bytes};
+use crate::peer::PeerError;
 
 const P_STR: &[u8] = b"BitTorrent protocol";
 
@@ -26,22 +29,31 @@ impl TorrentHandshake {
 }
 
 impl TryFrom<&[u8]> for TorrentHandshake {
-    type Error = DownloadError;
-    fn try_from(bytes: &[u8]) -> Result<Self, DownloadError> {
+    type Error = PeerError;
+    fn try_from(bytes: &[u8]) -> Result<Self, PeerError> {
         if bytes.len() != 68 {
-            return Err(DownloadError::InvalidHandshakeLength(bytes.len()));
-        };
-        if bytes[0] != 19 {
-            return Err(DownloadError::InvalidProtocolIdLength(bytes[0]));
-        };
-        if bytes[1..20] != *P_STR {
-            let p_str = bytes[1..20].try_into().map_err(|_| DownloadError::ByteConversionError)?;
-            return Err(DownloadError::InvalidProtocolId(p_str));
+            return Err(PeerError::InvalidHandshakeLength(bytes.len()));
         }
-        let flags: [u8; 8] = bytes[20..28].try_into().map_err(|_| DownloadError::ByteConversionError)?;
-        let info_hash: [u8; 20] = bytes[28..48].try_into().map_err(|_| DownloadError::ByteConversionError)?;
-        let peer_id: [u8; 20] = bytes[48..68].try_into().map_err(|_| DownloadError::ByteConversionError)?;
+        if bytes[0] != 19 {
+            return Err(PeerError::InvalidProtocolIdLength(bytes[0]));
+        }
+        if bytes[1..20] != *P_STR {
+            let p_str = bytes[1..20].try_into().expect("bytes verified to be length 68");
+            return Err(PeerError::InvalidProtocolId(p_str));
+        }
+        let flags: [u8; 8] = bytes[20..28].try_into().expect("bytes verified to be length 68");
+        let info_hash: [u8; 20] = bytes[28..48].try_into().expect("bytes verified to be length 68");
+        let peer_id: [u8; 20] = bytes[48..68].try_into().expect("bytes verified to be length 68");
         Ok(TorrentHandshake {flags, info_hash, peer_id})
+    }
+}
+
+impl fmt::Display for TorrentHandshake {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "peer id: ")?;
+        write_byte_string(&self.peer_id, f)?;
+        write!(f, ", flags: 0x")?;
+        write_bytes(&self.flags, f)
     }
 }
 
@@ -57,22 +69,19 @@ impl From<&TorrentHandshake> for [u8; 68] {
     }
 }
 
-pub(crate) async fn handshake(stream: &mut TcpStream, info_hash: &[u8; 20]) -> Result<(), DownloadError> {
+pub(crate) async fn handshake(address: &SocketAddrV4, stream: &mut TcpStream, info_hash: &[u8; 20]) -> Result<(), PeerError> {
     let mine = TorrentHandshake::new(info_hash);
     let my_bytes = <[u8;68]>::from(&mine);
-    stream.write_all(my_bytes.as_slice()).await.map_err(|e| DownloadError::TransmissionError(e))?;
+    stream.write_all(my_bytes.as_slice()).await.map_err(|e| PeerError::HandshakeTransmissionError(address.to_string(), e))?;
     let mut buf: [u8; 68] = [0; 68];
-    let num_read = stream.read_exact(&mut buf).await.map_err(|e| DownloadError::ReceiveError(e))?;
-    if num_read == buf.len() {
-        let slice: &[u8] = &buf;
-        let theirs = TorrentHandshake::try_from(slice)?;
-        if mine.info_hash != theirs.info_hash {
-            Err(DownloadError::MismatchedHash(mine.info_hash, theirs.info_hash))
-        } else {
-            Ok(())
-        }
-    }
-    else {
-        Err(DownloadError::InsufficientDataReceived(num_read))
+    stream.read_exact(&mut buf).await.map_err(|e| PeerError::HandshakeReceiveError(address.to_string(), e))?;
+
+    let slice: &[u8] = &buf;
+    let theirs = TorrentHandshake::try_from(slice)?;
+    if mine.info_hash != theirs.info_hash {
+        Err(PeerError::MismatchedHash(mine.info_hash, theirs.info_hash))
+    } else {
+        println!("handshaked with {}", &theirs);
+        Ok(())
     }
 }

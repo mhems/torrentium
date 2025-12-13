@@ -52,7 +52,7 @@ pub fn sha1_hash(bytes: &[u8]) -> [u8; 20] {
         h2 = h2.wrapping_add(c);
         h3 = h3.wrapping_add(d);
         h4 = h4.wrapping_add(e);
-    };
+    }
 
     from_ints::<5, 20>([h0, h1, h2, h3, h4], true).unwrap()
 }

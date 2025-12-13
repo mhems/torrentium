@@ -1,5 +1,20 @@
-pub mod metadata;
+use std::path::Path;
 
-pub mod peer;
+use crate::metadata::file::TorrentFile;
 
-pub mod util;
+mod metadata;
+mod peer;
+mod util;
+
+pub use peer::Bitfield;
+pub use peer::message::Message;
+
+const PEER_ID: &[u8; 20] = b"!MySuperCoolTorrent!";
+
+pub async fn download_torrent<P: AsRef<Path>>(path: P) -> std::result::Result<(), Box<dyn std::error::Error>> {
+    let path = path.as_ref();
+    let torrent_file: TorrentFile = TorrentFile::new(path).map_err(|e| Box::new(e))?;
+    let response = torrent_file.retrieve_peers().await?;
+
+    torrent_file.download(&response.peers).await
+}

@@ -1,20 +1,49 @@
-mod client;
-mod handshake;
-mod message;
-mod downloader;
+pub mod handshake;
+pub mod message;
+pub mod downloader;
 
-use std::{path::{PathBuf}, sync::Arc, fs};
+use std::path::Path;
+use std::{net::SocketAddrV4, sync::Arc};
 
-use crate::metadata::file::{FileModeInfo::{Multiple, Single}, TorrentFile};
-use crate::peer::{client::{ProtocolError, retrieve_peers}, downloader::{FileDownloadInfo, FileDownloadState, Downloader}};
-use crate::util::{self, md5::md5_hash};
+use crate::metadata::file::TorrentFile;
+use crate::peer::downloader::{FileDownloadInfo, FileDownloadState, Downloader};
 
-pub use downloader::DownloadError;
-
-use tempfile::TempDir;
 use tokio::sync::Mutex;
+use thiserror::Error;
 
-const PEER_ID: &[u8; 20] = b"!MySuperCoolTorrent!";
+#[derive(Debug, Error)]
+pub enum PeerError {
+    #[error("unable to connect to peer {0}: {1:?}")]
+    ConnectionError(String, std::io::Error),
+
+    #[error("unable to send handshake to peer {0}: {1:?}")]
+    HandshakeTransmissionError(String, tokio::io::Error),
+    #[error("did not receive handshake response from peer {0}: {1:?}")]
+    HandshakeReceiveError(String, tokio::io::Error),
+    #[error("expected peer handshake response to be 68 bytes but was {0} bytes")]
+    InvalidHandshakeLength(usize),
+    #[error("expected peer handshake response to have a protocol ID of length 19 bytes but was {0} bytes")]
+    InvalidProtocolIdLength(u8),
+    #[error("expected peer handshake response protocol to be `BitTorrent protocol` but was {0:?}")]
+    InvalidProtocolId([u8; 19]),
+    #[error("peer file hash ({0:?}) does not match requested file hash ({1:?})")]
+    MismatchedHash([u8; 20], [u8; 20]),
+
+    #[error("unknown message id {0}")]
+    UnknownMessageId(u8),
+    #[error("error encountered while reading {1} bytes: {0:?}")]
+    MessageReceiveError(tokio::io::Error, usize),
+    #[error("error encountered while sending {1} bytes: {0:?}")]
+    MessageTransmitError(tokio::io::Error, usize),
+    #[error("expected Piece message to have at least 8 bytes but only received {0} bytes")]
+    PieceMessageTooSmall(usize),
+
+    #[error("peer {0} has no more pieces available")]
+    Exhausted(String),
+
+    #[error("unable to save piece {0} to disk: {1:?}")]
+    DiskError(u32, tokio::io::Error),
+}
 
 #[derive(Debug)]
 pub struct Bitfield {
@@ -30,10 +59,12 @@ impl From<Vec<u8>> for Bitfield {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Error)]
 pub enum BitfieldError {
+    #[error("cannot represent {num_fields} bits with only {num_elements} bytes")]
     Unrepresentible{num_fields: usize, num_elements: usize},
-    PieceOutOfRange{index: usize, len: usize},
+    #[error("piece {0} is out of range of this Bitfield")]
+    PieceOutOfRange(usize),
 }
 
 impl Bitfield {
@@ -61,7 +92,7 @@ impl Bitfield {
 
     fn index_check(&self, index: usize) -> Result<(), BitfieldError> {
         if index >= self.num {
-            Err(BitfieldError::PieceOutOfRange { index, len: self.num })
+            Err(BitfieldError::PieceOutOfRange(index))
         } else {
             Ok(())
         }
@@ -115,93 +146,44 @@ impl Bitfield {
     }
 }
 
-pub async fn download(file: &TorrentFile, port: u16, num_seeds: usize) -> Result<(), DownloadError> {
-    match &file.info {
-        Single { .. } => download_file(file, port, num_seeds).await?,
-        Multiple { directory, files } => {
-            panic!("multiple files currently not supported");
-        }
-    };
-    Ok(())
-}
+pub async fn download(
+    peers: &Vec<SocketAddrV4>,
+    file: &TorrentFile,
+    dir_path: &Path,
+    ) -> Result<(), PeerError> {
+    let mut tasks = Vec::with_capacity(peers.len());
+    let dir_arc = Arc::new(dir_path.to_path_buf());
+    let info = FileDownloadInfo::from(file);
+    let info_arc: Arc<FileDownloadInfo> = Arc::new(info);
+    let state = FileDownloadState::new(file.num_pieces);
+    let state_arc = Arc::new(Mutex::new(state));
 
-pub async fn download_file(file: &TorrentFile, port: u16, num_seeds: usize) -> Result<(), DownloadError> {
-    match &file.info {
-        Single {filename, length: _, md5sum } => {
-            let tracker_response = retrieve_peers(file, port).await
-                .map_err(|_| DownloadError::RetrievalError)?;
-            let n = num_seeds.min(tracker_response.peers.len());
-            println!("using {} seeds (of {})", n, tracker_response.peers.len());
+    for i in 0..peers.len() {
+        let peer_clone = peers[i].clone();
+        let info_clone = info_arc.clone();
+        let state_clone = state_arc.clone();        
+        let dir_clone = dir_arc.clone();
 
-            let mut tasks = Vec::with_capacity(n);
-            
-            let path = PathBuf::from(filename);
-            let stem = path.file_stem().unwrap().to_string_lossy();
+        println!("spawning task to download '{}' from {}", &file.filename, peer_clone);
 
-            let dir = TempDir::new().map_err(|e| DownloadError::FileSystemError(e))?;
-            let dir_path = dir.path().to_path_buf();
+        tasks.push(tokio::spawn(async move {
+            let mut downloader = Downloader::new(
+                peer_clone,
+                info_clone,
+                state_clone,
+                dir_clone
+            ).await.map_err(|e| PeerError::ConnectionError(peer_clone.to_string(), e))?;
+            downloader.download_pieces().await
+        }));
+    }
 
-            println!("temp dir is {}", dir_path.to_string_lossy());
-
-            let basename = stem.as_ref().to_string();
-            let basename_arc = Arc::new(basename);
-
-            let info = FileDownloadInfo::try_from(file)?;
-            let info_arc: Arc<FileDownloadInfo> = Arc::new(info);
-
-            let state = FileDownloadState::new(file.num_pieces);
-            let state_arc = Arc::new(Mutex::new(state));
-
-            for i in 0..n {
-                let peer_clone = tracker_response.peers[i].clone();
-                let info_clone = info_arc.clone();
-                let state_clone = state_arc.clone();
-                let dir_clone = dir_path.clone();
-                let basename_clone = basename_arc.clone();
-                
-                println!("spawning task to download '{}' from {}", filename, peer_clone);
-
-                tasks.push(tokio::spawn(async move {
-                    let mut downloader = Downloader::new(
-                        peer_clone,
-                        info_clone,
-                        state_clone,
-                        dir_clone,
-                        basename_clone
-                    ).await.map_err(|e| ProtocolError::ConnectionError(e))?;
-                    downloader.download_file().await
-                }));
-            }
-
-            for (i, task) in tasks.into_iter().enumerate() {
-                match task.await {
-                    Ok(Ok(())) => (),
-                    Ok(Err(e)) => println!("[{}]: error with task: {:?}", tracker_response.peers[i], e),
-                    Err(e) => println!("[{}]: error with join: {:?}", tracker_response.peers[i], e),
-                }
-            }
-
-            let paths: Vec<PathBuf> = (0..file.num_pieces)
-                .map(|i| dir_path.join(format!("{}.{}.bin", stem, i)))
-                .collect();
-
-            util::io::concatenate_pieces(&paths, &path)
-                .map_err(|e| DownloadError::FileSystemError(e))?;
-
-            if let Some(expected_hash) = md5sum {
-                let bytes = fs::read(&path).map_err(DownloadError::FileSystemError)?;
-                let downloaded_hash = md5_hash(&bytes);
-                if downloaded_hash == *expected_hash {
-                    Ok(())
-                } else {
-                    Err(DownloadError::Md5Mismatch)
-                }
-            } else {
-                Ok(())
-            }
-        },
-        Multiple { directory, files } => {
-            panic!("multiple files currently not supported");
+    for (i, task) in tasks.into_iter().enumerate() {
+        match task.await {
+            Ok(Ok(())) => (),
+            Ok(Err(e)) => println!("[{}]: error with task: {:?}", peers[i], e),
+            Err(e) => println!("[{}]: error with join: {:?}", peers[i], e),
         }
     }
+
+    Ok(())
 }

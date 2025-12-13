@@ -1,6 +1,8 @@
 use std::collections::BTreeMap;
 use std::fmt;
 
+use thiserror::Error;
+
 #[derive(Debug)]
 pub enum BencodeValue {
     Integer(i64),
@@ -9,19 +11,31 @@ pub enum BencodeValue {
     Dictionary(BTreeMap<Vec<u8>, BencodeValue>),
 }
 
-#[derive(Debug)]
+#[derive(Debug, Error)]
 pub enum BencodeError {
+    #[error("{num_remaining} characters left in the stream")]
     UnconsumedContents {num_remaining: usize},
+    #[error("insufficient contents to complete the parse")]
     InsufficientContents,
+    #[error("unknown data type `{value}` at position {pos}")]
     UnknownType {pos: usize, value: u8},
+    #[error("integer with leading zeroes at position {pos}")]
     IntegerWithLeadingZeros {pos: usize},
+    #[error("integer without a value at position {pos}")]
     EmptyInteger {pos: usize},
+    #[error("integer with illegal value at position {pos}")]
     IllegalInteger {pos: usize},
+    #[error("data type missing the end indicator (`e`) at position {pos}")]
     UnterminatedValue {pos: usize},
+    #[error("string with negative length at position {pos}")]
     IllegalStringLength {pos: usize},
+    #[error("string does not have a `:` separator at position {pos}")]
     StringMissingSeparator {pos: usize},
+    #[error("dictionary with non-string key: {value}")]
     IllegalDictionaryKeyType {value: String},
+    #[error("dictionary already declared a key with name {name}")]
     DuplicateDictionaryKey {name: String},
+    #[error("dictionary keys are not in lexicographical order")]
     DictionaryKeysOutOfOrder,
 }
 
@@ -33,14 +47,14 @@ struct BencodeParser {
     length: usize
 }
 
-fn write_bytes(bytes: &[u8], f: &mut fmt::Formatter) -> fmt::Result {
+pub(crate) fn write_bytes(bytes: &[u8], f: &mut fmt::Formatter) -> fmt::Result {
     for byte in bytes {
         write!(f, "{:02X}", byte)?;
     }
     Ok(())
 }
 
-fn write_byte_string(bytes: &[u8], f: &mut fmt::Formatter) -> fmt::Result {
+pub(crate) fn write_byte_string(bytes: &[u8], f: &mut fmt::Formatter) -> fmt::Result {
     match std::str::from_utf8(bytes) {
         Ok(s) => if bytes.iter().all(|&byte| 0x20 <= byte && byte <= 0x7e) {
             write!(f, "{}", s)

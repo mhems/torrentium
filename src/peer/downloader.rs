@@ -6,12 +6,12 @@ use tokio::net::TcpStream;
 use tokio::fs::File;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::Mutex;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
-use crate::metadata::file::{FileModeInfo, TorrentFile};
-use crate::peer::Bitfield;
+use crate::metadata::file::TorrentFile;
+use crate::peer::{Bitfield, PeerError};
 use crate::peer::handshake::handshake;
-use crate::peer::{client::ProtocolError, message::{Message, MessageError}};
+use crate::peer::message::Message;
 use crate::util::sha1::sha1_hash;
 
 const BLOCK_SIZE: u32 = 16 * 1024;
@@ -24,8 +24,7 @@ pub struct Downloader {
     shared_state: Arc<Mutex<FileDownloadState>>,
     skip_set: HashSet<u32>,
     state: State,
-    basename: Arc<String>,
-    dir: PathBuf,
+    dir: Arc<PathBuf>,
 }
 
 #[derive(Debug, Clone)]
@@ -48,38 +47,13 @@ struct PieceDownloadProgress {
     data: Vec<u8>,
 }
 
-#[derive(Debug)]
-pub enum DownloadError {
-    CannotDownloadMultipleFiles,
-    InvalidHandshakeLength(usize),
-    InvalidProtocolIdLength(u8),
-    InvalidProtocolId([u8; 19]),
-    ByteConversionError,
-    TransmissionError(std::io::Error),
-    ReceiveError(std::io::Error),
-    InsufficientDataReceived(usize),
-    MismatchedFlags([u8; 8], [u8; 8]),
-    MismatchedHash([u8; 20], [u8; 20]),
-    MismatchedPeerId([u8; 20], [u8; 20]),
-    RetrievalError,
-    Message,
-    FileSystemError(std::io::Error),
-    Md5Mismatch,
-}
-
-impl TryFrom<&TorrentFile> for FileDownloadInfo {
-    type Error = DownloadError;
-    fn try_from(file: &TorrentFile) -> Result<Self, DownloadError> {
-        match &file.info {
-            FileModeInfo::Single { .. } => {
-                Ok(FileDownloadInfo {
-                    num_pieces: file.num_pieces as u64,
-                    bytes_per_piece: file.num_bytes_per_piece as usize,
-                    piece_hashes: file.piece_hashes.clone(),
-                    hash: file.hash.clone(),
-                })
-            },
-            FileModeInfo::Multiple { .. } => Err(DownloadError::CannotDownloadMultipleFiles)
+impl From<&TorrentFile> for FileDownloadInfo {
+    fn from(file: &TorrentFile) -> Self {
+        FileDownloadInfo {
+            num_pieces: file.num_pieces as u64,
+            bytes_per_piece: file.num_bytes_per_piece as usize,
+            piece_hashes: file.piece_hashes.clone(),
+            hash: file.hash.clone()
         }
     }
 }
@@ -131,12 +105,18 @@ enum State {
     
 }
 
+#[macro_export]
+macro_rules! piece_filename {
+    ($a:expr) => {
+        format!("piece_{}.bin", $a)
+    };
+}
+
 impl Downloader {
     pub async fn new(address: SocketAddrV4,
                info: Arc<FileDownloadInfo>,
                state: Arc<Mutex<FileDownloadState>>,
-               dir: PathBuf,
-               basename: Arc<String>
+               dir: Arc<PathBuf>,
                ) -> std::io::Result<Self> {
         Ok(Downloader {
             address,
@@ -145,32 +125,23 @@ impl Downloader {
             shared_state: state,
             skip_set: HashSet::new(),
             state: State::Curious,
-            dir,
-            basename
+            dir
         })
     }
 
-    async fn handshake(&mut self) -> Result<(), DownloadError> {
-        handshake( &mut self.connection, &self.info.hash).await
+    async fn get_message(&mut self) -> Result<Message, PeerError> {
+        Message::read_message(&mut self.connection).await
     }
 
-    async fn get_message(&mut self) -> Result<Message, ProtocolError> {
-        Message::read_message(&mut self.connection)
-            .await
-            .map_err(|e| ProtocolError::ReadError(e))
-    }
-
-    pub async fn download_file(self: &mut Self) -> Result<(), ProtocolError> {
-        self.handshake().await.map_err(|e| ProtocolError::HandshakeError(e))?;
+    pub async fn download_pieces(self: &mut Self) -> Result<(), PeerError> {
+        handshake(&self.address, &mut self.connection, &self.info.hash).await?;
         println!("...handshaked with {}!", self.address);
 
         let num_pieces = self.info.piece_hashes.len();
         let bitfield_len = (num_pieces + 7) / 8;
         let empty = vec![0u8; bitfield_len];
 
-        Message::send_bitfield(&mut self.connection, &empty)
-            .await
-            .map_err(|e| ProtocolError::WriteError(e))?;
+        Message::send_bitfield(&mut self.connection, &empty).await?;
     
         self.state = State::Curious;
 
@@ -182,15 +153,13 @@ impl Downloader {
                     if let Message::Bitfield { bitfield } = msg {
                         if bitfield.all() {
                             self.state = State::Interested;
-                            Message::send_interested(&mut self.connection)
-                                .await
-                                .map_err(|e| ProtocolError::WriteError(e))?;
+                            Message::send_interested(&mut self.connection).await?;
                             println!("[{}]: interest expressed", self.address);
                         } else {
                             self.state = State::NotInterested;
                             println!("[{}]: not fully seeded, abandoning", self.address);
                         }
-                    };
+                    }
                 },
                 State::Choked | State::Interested => {
                     let msg = self.get_message().await?;
@@ -199,7 +168,7 @@ impl Downloader {
                     }
                 },
                 State::Unchoked => {
-                    if let Err(ProtocolError::Exhausted) = self.try_download_piece().await {
+                    if let Err(PeerError::Exhausted(_)) = self.try_download_piece().await {
                         self.state = State::NotInterested;
                     }
                 },
@@ -212,7 +181,7 @@ impl Downloader {
         Ok(())
     }
 
-    async fn try_download_piece(&mut self) -> Result<(), ProtocolError> {
+    async fn try_download_piece(&mut self) -> Result<(), PeerError> {
         let piece = {
             let mut guard = self.shared_state.lock().await;
             println!("[{}]: {:.4}% to go", self.address, (guard.todo.len() as f32) * 100.0 / (self.info.num_pieces as f32));
@@ -222,21 +191,19 @@ impl Downloader {
                 p
             } else {
                 println!("[{}]: exhausted", self.address);
-                return Err(ProtocolError::Exhausted);
+                return Err(PeerError::Exhausted(self.address.to_string()));
             }
         };
 
-        let result = Downloader::download_piece(&mut self.connection, piece, self.info.bytes_per_piece)
-                .await
-                .map_err(|e| ProtocolError::ReadError(e));
+        let result = Downloader::download_piece(&mut self.connection, piece, self.info.bytes_per_piece).await;
 
         match result {
             Ok(data) => {
                 let data_hash = sha1_hash(&data);
                 if data_hash == self.info.piece_hashes[piece as usize] {
-                    Downloader::save_piece(&self.dir, &self.basename, piece, &data)
+                    Downloader::save_piece(&self.dir, piece, &data)
                             .await
-                            .map_err(|e| ProtocolError::DiskError(e))?;
+                            .map_err(|e| PeerError::DiskError(piece, e))?;
                     let mut guard = self.shared_state.lock().await;
                     guard.complete(piece);
                 } else {
@@ -257,7 +224,7 @@ impl Downloader {
         Ok(())
     }
 
-    async fn download_piece(stream: &mut TcpStream, piece: u32, length: usize) -> Result<Vec<u8>, MessageError> {
+    async fn download_piece(stream: &mut TcpStream, piece: u32, length: usize) -> Result<Box<[u8]>, PeerError> {
         let mut progress = PieceDownloadProgress::new(length);
         let mut choked = false;
         let mut request_size = 0u32;
@@ -281,11 +248,11 @@ impl Downloader {
             }
         }
 
-        Ok(progress.data)
+        Ok(progress.data.into_boxed_slice())
     }
 
-    async fn save_piece(dir: &Path, basename: &str, piece: u32, bytes: &[u8]) -> tokio::io::Result<()> {
-        let path = dir.join(format!("{}.{}.bin", basename, piece));
+    async fn save_piece(dir: &PathBuf, piece: u32, bytes: &[u8]) -> tokio::io::Result<()> {
+        let path = dir.join(piece_filename!(piece));
         let mut file = File::create(path).await?;
         file.write_all(bytes).await?;
         Ok(())

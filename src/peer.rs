@@ -56,8 +56,8 @@ pub struct Bitfield {
 
 impl From<Vec<u8>> for Bitfield {
     fn from(v: Vec<u8>) -> Self {
-        let num = v.len() * 8;
-        Bitfield { masks: v, num, last_mask: 0xFF }
+        let num: usize = 8 * (v.len() - 1) + v.last().unwrap().count_ones() as usize;
+        Bitfield::from_vec(v, num)
     }
 }
 
@@ -72,8 +72,8 @@ pub enum BitfieldError {
 impl Bitfield {
     pub fn new(num: usize, set: bool) -> Self {
         let num_elements = num.div_ceil(8);
-        let masks = if set { vec![0xFF; num_elements] } else { vec![0; num_elements] };
-        Bitfield { masks, num, last_mask: 0xFF}
+        let masks: Vec<u8> = if set { vec![0xFF; num_elements] } else { vec![0; num_elements] };
+        Self::from_vec(masks, num)
     }
 
     pub fn try_from_vec(v: Vec<u8>, num: usize) -> Result<Self, BitfieldError> {
@@ -81,7 +81,11 @@ impl Bitfield {
         if v.len() < num_elements {
             return Err(BitfieldError::Unrepresentible { num_fields: num, num_elements: v.len() });
         }
-        let extra = num_elements % 8;
+        Ok(Self::from_vec(v, num))
+    }
+
+    fn from_vec(v: Vec<u8>, num: usize) -> Self {
+        let extra = num % 8;
         let last_mask: u8 = if extra != 0 { ((1 << extra) - 1) << (8 - extra) } else { 0xFF };
         let mut bf = Bitfield { masks: v, num, last_mask };
         if extra != 0 {
@@ -89,7 +93,7 @@ impl Bitfield {
                 *last &= last_mask;
             }
         }
-        Ok(bf)
+        bf
     }
 
     fn index_check(&self, index: usize) -> Result<(), BitfieldError> {

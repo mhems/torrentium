@@ -87,8 +87,8 @@ impl Message {
     }
 
     async fn read_bitfield(stream: &mut TcpStream, payload_length: usize) -> Result<Self, PeerError> {
-        let bitfield = Message::read_variable_message(stream, payload_length).await?;
-        Ok(Message::Bitfield{ bitfield: Bitfield::from(bitfield) })
+        let bytes = Message::read_variable_message(stream, payload_length).await?;
+        Ok(Message::Bitfield{ bitfield: Bitfield::from(bytes) })
     }
 
     async fn read_piece(stream: &mut TcpStream, payload_length: usize) -> Result<Self, PeerError> {

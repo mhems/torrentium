@@ -7,8 +7,8 @@ mod metadata;
 mod peer;
 mod util;
 
-pub use peer::Bitfield;
-pub use peer::message::Message;
+//pub use peer::Bitfield;
+//pub use peer::message::Message;
 
 const PEER_ID: &[u8; 20] = b"!MySuperCoolTorrent!";
 

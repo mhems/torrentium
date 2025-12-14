@@ -170,14 +170,16 @@ impl Downloader {
                 State::Curious => {
                     info!("waiting for Bitfield response from peer {} ...", self.address);
                     let msg = self.get_message().await?;
-                    if let Message::Bitfield { bitfield } = msg {
+                    if let Message::Bitfield { mut bitfield } = msg {
+                        bitfield.num = self.info.piece_hashes.len();
                         if bitfield.all() {
                             self.state = State::Interested;
                             Message::send_interested(&mut self.connection).await?;
                             info!("peer {} is a seed; interest expressed", self.address);
                         } else {
+                            // TODO handle incomplete peers
                             self.state = State::NotInterested;
-                            info!("peer {} is not fully seeded; abandoning download", self.address);
+                            info!("peer {} is not fully seeded ({}/{}); abandoning download", self.address, bitfield.num_set(), bitfield.num);
                         }
                     }
                 },
@@ -262,6 +264,8 @@ impl Downloader {
             if !choked {
                 request_size = progress.get_next_block_size();
                 info!("asking for {} bytes at offset {} for piece {} from peer {} ({} bytes remain)", request_size, progress.offset, piece, address, progress.remaining());
+                
+                // TODO improve upon lock-step by priming up to 5 requests at a given time
                 Message::send_request(stream, piece, progress.offset, request_size).await?;
             }
 

@@ -14,7 +14,7 @@ const PEER_ID: &[u8; 20] = b"!MySuperCoolTorrent!";
 
 pub fn parse_torrent<P: AsRef<Path>>(path: P) -> std::result::Result<TorrentFile, Box<dyn std::error::Error>> {
     let path = path.as_ref();
-    let torrent_file: TorrentFile = TorrentFile::new(path).map_err(|e| Box::new(e))?;
+    let torrent_file: TorrentFile = TorrentFile::new(path).map_err(Box::new)?;
     Ok(torrent_file)
 }
 

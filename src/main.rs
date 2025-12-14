@@ -24,16 +24,17 @@ async fn main() {
     let timer = LocalTime::new(
         format_description!("[month]/[day]/[year] [hour repr:24]:[minute]:[second].[subsecond digits:4]"));
     tracing_subscriber::fmt().with_writer(non_blocking).with_ansi(false).with_timer(timer).init();
+    //tracing_subscriber::fmt().with_timer(timer).init();
 
     if args.inspect {
         match parse_torrent(&filename) {
             Ok(torrent) => println!("Contents of {}:\n{}", &filename, torrent),
-            Err(e) => println!("Unable to parse file: {:?}", e),
+            Err(e) => println!("Unable to parse file: {e:?}"),
         }
     } else {
         match download_torrent(&filename).await {
             Ok(()) => println!("Successfully downloaded file(s) from {}!", &filename),
-            Err(e) => println!("{:?}", e),
+            Err(e) => println!("{e:?}"),
         }
     }
 }

@@ -48,6 +48,7 @@ pub struct FileDownloadState {
 struct PieceDownloadProgress {
     offset: u32,
     data: Vec<u8>,
+    length: u32
 }
 
 impl From<&TorrentFile> for FileDownloadInfo {
@@ -55,7 +56,7 @@ impl From<&TorrentFile> for FileDownloadInfo {
         FileDownloadInfo {
             bytes_per_piece: file.num_bytes_per_piece as usize,
             piece_hashes: file.piece_hashes.clone(),
-            hash: file.hash.clone()
+            hash: file.hash
         }
     }
 }
@@ -79,11 +80,11 @@ impl FileDownloadState {
 
 impl PieceDownloadProgress {
     pub fn new(piece_size: usize) -> Self {
-        PieceDownloadProgress { offset: 0, data: Vec::with_capacity(piece_size) }
+        PieceDownloadProgress { offset: 0, data: Vec::with_capacity(piece_size), length: piece_size as u32 }
     }
 
     pub fn remaining(&self) -> u32 {
-        (self.data.capacity() as u32) - self.offset
+        self.length - self.offset
     }
 
     pub fn get_next_block_size(&self) -> u32 {
@@ -94,10 +95,11 @@ impl PieceDownloadProgress {
         self.get_next_block_size() == 0
     }
 
-    pub fn add_block(&mut self, block: &[u8]) {
-        self.data.extend_from_slice(block);
-        self.offset += block.len() as u32;
-    }
+    pub fn add_block(&mut self, mut block: Vec<u8>) {
+        let n = block.len() as u32;
+        self.data.append(&mut block);
+        self.offset += n;
+    }   
 }
 
 #[derive(Debug, Copy, Clone)]
@@ -152,7 +154,7 @@ impl Downloader {
         Message::read_message(&mut self.connection).await
     }
 
-    pub async fn download_pieces(self: &mut Self) -> Result<(), PeerError> {
+    pub async fn download_pieces(&mut self) -> Result<(), PeerError> {
         info!("reaching out to handshake with peer {} (info hash = {})", self.address, to_string(&self.info.hash));
         handshake(&self.address, &mut self.connection, &self.info.hash).await?;
 
@@ -271,9 +273,9 @@ impl Downloader {
 
             match Message::read_message(stream).await? {
                 Message::Piece { index, begin, bytes} => {
-                    info!("peer {} responsed with piece {} at offset {} with length {}", address, index, begin, bytes.len());
+                    info!("peer {} responded with piece {} at offset {} with length {}", address, index, begin, bytes.len());
                     if index == piece && progress.offset == begin && bytes.len() as u32 == request_size {
-                        progress.add_block(&bytes);
+                        progress.add_block(bytes);
                     }
                 },
                 Message::Choke => {

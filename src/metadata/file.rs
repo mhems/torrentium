@@ -104,7 +104,7 @@ impl fmt::Display for FileModeInfo {
                     .collect::<Vec<_>>()
                     .join(", ");
 
-                write!(f, "[{}] -> {}/", file_list, directory)
+                write!(f, "[{file_list}] -> {directory}/")
             }
         }
     }
@@ -119,16 +119,16 @@ impl fmt::Display for TorrentFile {
             .collect::<Vec<_>>()
             .join(", "))?;
         if let Some(date) = &self.creation_date {
-            writeln!(f, "created: {} seconds since epoch", date)?;
+            writeln!(f, "created: {date} seconds since epoch")?;
         }
         if let Some(text) = &self.comment {
-            writeln!(f, "comment: {}", text)?;
+            writeln!(f, "comment: {text}")?;
         }
         if let Some(author) = &self.created_by {
-            writeln!(f, "created by: {}", author)?;
+            writeln!(f, "created by: {author}")?;
         }
         if let Some(e) = &self.encoding {
-            writeln!(f, "encoding: {}", e)?;
+            writeln!(f, "encoding: {e}")?;
         }
         writeln!(f, "private: {}", self.private)?;
         writeln!(f, "num hashes: {}", self.piece_hashes.len())?;
@@ -158,7 +158,7 @@ impl TorrentFile {
         let filename = filepath.as_ref()
             .file_name()
             .and_then(|name| name.to_string_lossy().into())
-            .ok_or_else(|| TorrentFileError::InvalidFilePath)?.to_string();
+            .ok_or(TorrentFileError::InvalidFilePath)?.to_string();
 
         match fs::read(filepath) {
             Ok(contents) => {
@@ -166,7 +166,7 @@ impl TorrentFile {
                     Ok(bencode_value) => {
                         match bencode_value {
                             BencodeValue::Dictionary(items) => {
-                                TorrentFile::extract(&filename, items)
+                                TorrentFile::extract(&filename, &items)
                             },
                             _ => Err(TorrentFileError::FileIsNotDictionary)
                         }
@@ -178,21 +178,21 @@ impl TorrentFile {
         }
     }
 
-    pub async fn retrieve_peers(self: &Self) -> std::result::Result<TrackerResponse, TrackerError> {
+    pub async fn retrieve_peers(&self) -> std::result::Result<TrackerResponse, TrackerError> {
         let url = self.get_announce_url(self.total_num_bytes, PEER_ID, 12345);
         retrieve_peers(url).await
     }
 
-    pub async fn download(self: &Self, peers: &Vec<SocketAddrV4>) -> std::result::Result<(), Box<dyn std::error::Error>> {
+    pub async fn download(&self, peers: &[SocketAddrV4]) -> std::result::Result<(), Box<dyn std::error::Error>> {
         let dir = tempfile::TempDir::new().expect("should be able to construct temporary directory");
         let dir_path = dir.path();
 
-        download(&peers, self, &dir_path).await?;
+        download(peers, self, dir_path).await?;
 
-        reconstitute_files_from_torrent(&self, &dir_path).map_err(|e| e.into())
+        reconstitute_files_from_torrent(self, dir_path).map_err(|e| e.into())
     }
 
-    fn extract(filename: &String, items: BTreeMap<Vec<u8>, BencodeValue>) -> Result<Self> {
+    fn extract(filename: &str, items: &BTreeMap<Vec<u8>, BencodeValue>) -> Result<Self> {
         let announce = Self::extract_string(items.get(ANNOUNCE), "announce", true)?.unwrap();
         let _ = Url::parse(&announce).map_err(|_| TorrentFileError::InvalidAnnounceUrl(announce.to_string()))?;
         let announce_list = Self::extract_announce_list(items.get(ANNOUNCE_LIST))?;
@@ -213,7 +213,7 @@ impl TorrentFile {
         let private_int = Self::extract_uint(info_items.get(PRIVATE), "private", false)?;
         let private = if let Some(v) = private_int {
             if v <= 1 {
-                if v == 0 { true } else { false }
+                v == 0
             } else {
                 return Err(TorrentFileError::InvalidPrivateValue(v));
             }
@@ -224,11 +224,7 @@ impl TorrentFile {
         let num_pieces = piece_hashes.len();
         let hash = sha1_hash(Vec::from(items.get(INFO).unwrap()).as_slice());
         let name = Self::extract_string(info_items.get(NAME), "name", true)?.unwrap();
-        let (info, total_num_bytes) = if !info_items.contains_key(FILES) {
-            let length = Self::extract_uint(info_items.get(LENGTH), "length", true)?.unwrap();
-            let md5sum = Self::extract_md5sum(info_items.get(MD5SUM))?;
-            (FileModeInfo::Single { filename: name, length: length, md5sum: md5sum }, length)
-        } else {
+        let (info, total_num_bytes) = if info_items.contains_key(FILES) {
             let mut files = Vec::new();
             let mut length: u64 = 0;
             match info_items.get(FILES) {
@@ -254,7 +250,11 @@ impl TorrentFile {
             if files.is_empty() {
                 return Err(TorrentFileError::KeyMapsToAnEmptyList("files"))
             }
-            (FileModeInfo::Multiple { directory: name, files: files }, length)
+            (FileModeInfo::Multiple { directory: name, files }, length)
+        } else {
+            let length = Self::extract_uint(info_items.get(LENGTH), "length", true)?.unwrap();
+            let md5sum = Self::extract_md5sum(info_items.get(MD5SUM))?;
+            (FileModeInfo::Single { filename: name, length, md5sum }, length)
         };
 
         let np = num_pieces as u64;
@@ -278,7 +278,7 @@ impl TorrentFile {
             piece_hashes,
             hash,
             private,
-            filename: filename.clone()
+            filename: filename.to_owned()
         })
     }
 
@@ -312,7 +312,7 @@ impl TorrentFile {
                             Err(TorrentFileError::NegativeInteger(*num))
                         }
                         else {
-                            Ok(Some(*num as u64))
+                            Ok(Some(num.unsigned_abs()))
                         }
                     },
                     _ => Err(TorrentFileError::KeyDoesNotMapToInteger(name))
@@ -340,7 +340,7 @@ impl TorrentFile {
             },
             None => return if mandatory { Err(TorrentFileError::MissingRequiredKey(name)) } else { Ok(list) },
         }
-        return Ok(list);
+        Ok(list)
     }
 
     fn extract_md5sum(value: Option<&BencodeValue>) -> Result<Option<[u8; 16]>> {
@@ -366,7 +366,7 @@ impl TorrentFile {
             return Err(TorrentFileError::KeyMapsToAnEmptyList("path"));
         }
         let md5sum = Self::extract_md5sum(items.get(MD5SUM))?;
-        return Ok(MultiFileInfo { length: length, md5sum: md5sum, path: path })
+        Ok(MultiFileInfo { length, md5sum, path })
     }
 
     fn extract_announce_list(value: Option<&BencodeValue>) -> Result<Vec<Vec<String>>> {
@@ -380,7 +380,7 @@ impl TorrentFile {
                     for element in elements {
                         let inner_list = match element {
                             BencodeValue::List(_) => Self::extract_list_of_string(Some(element), "announce-list", false)?,
-                            BencodeValue::ByteString(bytes) => vec![Self::convert_string(element).ok_or(TorrentFileError::InvalidString(bytes.to_vec()))?],
+                            BencodeValue::ByteString(bytes) => vec![Self::convert_string(element).ok_or(TorrentFileError::InvalidString(bytes.clone()))?],
                             _ => return Err(TorrentFileError::InvalidAnnounceListElement),
                         };
                         announce_list.push(inner_list);
@@ -427,7 +427,7 @@ impl TorrentFile {
             .append_pair("compact", "1")
             .append_pair("left", &length.to_string());
 
-        let new_url_str = format!("{}&info_hash={}&peer_id={}", url, encoded_hash, encoded_id);
+        let new_url_str = format!("{url}&info_hash={encoded_hash}&peer_id={encoded_id}");
         Url::parse(&new_url_str).expect("internally formed URL expected to be valid")
     }
 }

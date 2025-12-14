@@ -153,7 +153,7 @@ impl Bitfield {
 }
 
 pub async fn download(
-    peers: &Vec<SocketAddrV4>,
+    peers: &[SocketAddrV4],
     file: &TorrentFile,
     dir_path: &Path,
     ) -> Result<(), PeerError> {
@@ -164,7 +164,7 @@ pub async fn download(
     let state = FileDownloadState::new(file.num_pieces);
     let state_arc = Arc::new(Mutex::new(state));
 
-    let pb = ProgressBar::new(file.total_num_bytes as u64);
+    let pb = ProgressBar::new(file.total_num_bytes);
 
     pb.set_style(
         ProgressStyle::default_bar()
@@ -172,23 +172,23 @@ pub async fn download(
             .unwrap(),
     );
 
-    for i in 0..peers.len() {
-        let peer_clone = peers[i].clone();
+    for peer in peers {
+        let peer_copy = *peer;
         let info_clone = info_arc.clone();
         let state_clone = state_arc.clone();        
         let dir_clone = dir_arc.clone();
         let pb_clone = pb.clone();
         
-        info!("spawning task to collaboratively download '{}' from {}", &file.filename, peer_clone);
+        info!("spawning task to collaboratively download '{}' from {}", &file.filename, peer_copy);
 
         tasks.push(tokio::spawn(async move {
             let mut downloader = Downloader::new(
-                peer_clone,
+                peer_copy,
                 info_clone,
                 state_clone,
                 dir_clone,
                 pb_clone
-            ).await.map_err(|e| PeerError::ConnectionError(peer_clone.to_string(), e))?;
+            ).await.map_err(|e| PeerError::ConnectionError(peer_copy.to_string(), e))?;
             downloader.download_pieces().await
         }));
     }

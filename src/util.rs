@@ -5,7 +5,7 @@ pub mod sha1;
 pub mod md5;
 
 pub fn to_string(bytes: &[u8]) -> String {
-     bytes.iter().map(|&byte| format!("{:02x}", byte)).collect::<Vec<_>>().join("")
+     bytes.iter().map(|&byte| format!("{byte:02x}")).collect::<Vec<_>>().join("")
 }
 
 fn pad_bytes(bytes: &[u8], big_endian: bool) -> Vec<u8> {

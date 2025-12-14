@@ -79,10 +79,10 @@ pub(crate) async fn handshake(address: &SocketAddrV4, stream: &mut TcpStream, in
 
     let slice: &[u8] = &buf;
     let theirs = TorrentHandshake::try_from(slice)?;
-    if mine.info_hash != theirs.info_hash {
-        Err(PeerError::MismatchedHash(mine.info_hash, theirs.info_hash))
-    } else {
+    if mine.info_hash == theirs.info_hash {
         info!("shook hands with peer {} ({})", address, &theirs);
         Ok(())
+    } else {
+        Err(PeerError::MismatchedHash(mine.info_hash, theirs.info_hash))
     }
 }

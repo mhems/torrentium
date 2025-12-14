@@ -85,7 +85,7 @@ impl TryFrom<&BencodeValue> for TrackerResponse {
                         }
                     })?.unwrap();
                 let peers = extract_peers(items.get(PEERS))?;
-                Ok(TrackerResponse { interval: interval, peers: peers })
+                Ok(TrackerResponse { interval, peers })
             },
             _ => Err(TrackerError::TrackerResponseNotADictionary),
         }
@@ -94,9 +94,9 @@ impl TryFrom<&BencodeValue> for TrackerResponse {
 
 impl fmt::Display for TrackerResponse {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "Interval (s): {}\n", self.interval)?;
+        writeln!(f, "Interval (s): {}", self.interval)?;
         for (i, socket) in self.peers.iter().enumerate() {
-            write!(f, "{:03}: {}\n", i, socket)?;
+            writeln!(f, "{i:03}: {socket}\n")?;
         }
         Ok(())
     }
@@ -107,7 +107,7 @@ pub async fn retrieve_peers(url: Url) -> Result<TrackerResponse, TrackerError> {
     let response_bytes: &[u8] = &response.bytes().await.map_err(TrackerError::NoTrackerResponseBody)?;
 
     let bencoded_response = BencodeValue::try_from(response_bytes)
-        .map_err(|e| TrackerError::NonBencodedTrackerResponse(e))?;
+        .map_err(TrackerError::NonBencodedTrackerResponse)?;
 
     let tracker_response = TrackerResponse::try_from(&bencoded_response)?;
 

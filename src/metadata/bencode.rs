@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::fmt;
+use std::cmp::Ordering;
 
 use thiserror::Error;
 
@@ -55,8 +56,8 @@ pub(crate) fn write_bytes(bytes: &[u8], f: &mut fmt::Formatter) -> fmt::Result {
 
 pub(crate) fn write_byte_string(bytes: &[u8], f: &mut fmt::Formatter) -> fmt::Result {
     match std::str::from_utf8(bytes) {
-        Ok(s) => if bytes.iter().all(|&byte| 0x20 <= byte && byte <= 0x7e) {
-            write!(f, "{}", s)
+        Ok(s) => if bytes.iter().all(|&byte| (0x20..=0x7e).contains(&byte)) {
+            write!(f, "{s}")
         } else {
             write_bytes(bytes, f)
         }
@@ -67,14 +68,14 @@ pub(crate) fn write_byte_string(bytes: &[u8], f: &mut fmt::Formatter) -> fmt::Re
 impl fmt::Display for BencodeValue {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
-            BencodeValue::Integer(num) => write!(f, "{}", num),
+            BencodeValue::Integer(num) => write!(f, "{num}"),
             BencodeValue::ByteString(bytes) => {
                 write_byte_string(bytes, f)
             }
             BencodeValue::List(elements) => {
                 write!(f, "[")?;
                 for element in elements {
-                    write!(f, "{}\n", element)?;
+                    writeln!(f, "{element}")?;
                 }
                 write!(f, "]")?;
                 Ok(())
@@ -83,7 +84,7 @@ impl fmt::Display for BencodeValue {
                 write!(f, "{{")?;
                 for (key, value) in items {
                     write_byte_string(key, f)?;
-                    write!(f, " => {}\n", value)?;         
+                    writeln!(f, " => {value}")?;         
                 }
                 write!(f, "}}")?;
                 Ok(())
@@ -105,7 +106,7 @@ type Result<T> = std::result::Result<T, BencodeError>;
 impl From<&BencodeValue> for Vec<u8> {
     fn from(value: &BencodeValue) -> Vec<u8> {
         match value {
-            BencodeValue::Integer(i) => format!("i{}e", i).as_bytes().to_vec(),
+            BencodeValue::Integer(i) => format!("i{i}e").as_bytes().to_vec(),
             BencodeValue::ByteString(bytes) => {
                 let mut v: Vec<u8> = Vec::with_capacity(10 + 1 + bytes.len());
                 v.extend(format!("{}:", bytes.len()).as_bytes());
@@ -144,10 +145,10 @@ impl BencodeParser {
 
     fn deserialize(&mut self) -> Result<BencodeValue> {
         let value: BencodeValue = self.parse_value()?;
-        if self.pos != self.length {
-            Err(BencodeError::UnconsumedContents {num_remaining: self.length - self.pos})
-        } else {
+        if self.pos == self.length {
             Ok(value)
+        } else {
+            Err(BencodeError::UnconsumedContents {num_remaining: self.length - self.pos})
         }
     }
 
@@ -244,21 +245,22 @@ impl BencodeParser {
                 break
             }
             let key: BencodeValue = self.parse_string()?;
-            let key_bytes = match &key {
-                BencodeValue::ByteString (bytes ) => bytes,
-                _ => return Err(BencodeError::IllegalDictionaryKeyType { value: key.to_string() })
+            let BencodeValue::ByteString (key_bytes ) = &key else {
+                return Err(BencodeError::IllegalDictionaryKeyType { value: key.to_string() })
             };
 
             if let Some(pair) = map.last_key_value() {
-                if key_bytes < pair.0 {
-                    return Err(BencodeError::DictionaryKeysOutOfOrder);
-                } else if key_bytes == pair.0 {
-                    return Err(BencodeError::DuplicateDictionaryKey { name: key.to_string() })
+                match key_bytes.cmp(pair.0) {
+                    Ordering::Less =>
+                        return Err(BencodeError::DictionaryKeysOutOfOrder),
+                    Ordering::Equal =>
+                        return Err(BencodeError::DuplicateDictionaryKey { name: key.to_string() }),
+                    Ordering::Greater => ()
                 }
             }
             
             let value: BencodeValue = self.parse_value()?;
-            map.insert(key_bytes.to_vec(), value);
+            map.insert(key_bytes.clone(), value);
         }
         self.pos += 1;
         Ok(BencodeValue::Dictionary(map))
@@ -274,10 +276,10 @@ impl BencodeParser {
 
     fn expect_end<>(&self) -> Result<()> {
         self.ensure_available()?;
-        if self.contents[self.pos] != b'e' {
-            Err(BencodeError::UnterminatedValue { pos: self.pos })
-        } else {
+        if self.contents[self.pos] == b'e' {
             Ok(())
+        } else {
+            Err(BencodeError::UnterminatedValue { pos: self.pos })
         }
     }
 }

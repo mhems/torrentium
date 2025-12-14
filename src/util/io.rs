@@ -68,7 +68,7 @@ pub fn reconstitute_files_from_torrent(torrent: &TorrentFile, dir: &Path) -> Res
     }
 
     for file in &files {
-        verify_md5(file)?
+        verify_md5(file)?;
     }
 
     Ok(())
@@ -98,7 +98,7 @@ fn reconstitute_files(infos: &[FileInfo], piece_paths: &[PathBuf]) -> Result<(),
 
     for (i, info) in infos.iter().enumerate().progress() {
         if let Some(parent) = info.filepath.parent() {
-            fs::create_dir_all(parent).map_err(FileError::FileSystemError)?
+            fs::create_dir_all(parent).map_err(FileError::FileSystemError)?;
         }
         let out_file = File::create(&info.filepath).map_err(FileError::FileSystemError)?;
         let mut writer = BufWriter::new(out_file);

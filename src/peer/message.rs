@@ -168,7 +168,7 @@ impl Message {
     pub async fn send_bitfield(stream: &mut TcpStream, bitmap: &[u8]) -> Result<(), PeerError> {
         let mut buf = vec![0; 4 + 1 + bitmap.len()];
         Message::encode_header(MessageId::Bitfield, 1 + bitmap.len() as u32, &mut buf);
-        buf[5..].copy_from_slice(&bitmap);
+        buf[5..].copy_from_slice(bitmap);
         Message::send_bytes(stream, &buf).await
     }
 

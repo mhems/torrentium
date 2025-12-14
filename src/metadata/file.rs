@@ -2,9 +2,11 @@ use std::collections::BTreeMap;
 use std::net::SocketAddrV4;
 use std::path::Path;
 use std::{fmt, fs};
+
 use url::Url;
 use percent_encoding::{percent_encode, NON_ALPHANUMERIC};
 use thiserror::Error;
+use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
 use crate::PEER_ID;
 use crate::peer::download;
@@ -118,8 +120,12 @@ impl fmt::Display for TorrentFile {
             .map(|v| format!("[{}]", v.join(", ")))
             .collect::<Vec<_>>()
             .join(", "))?;
-        if let Some(date) = &self.creation_date {
-            writeln!(f, "created: {date} seconds since epoch")?;
+        if let Some(seconds) = &self.creation_date {
+            let created_str = OffsetDateTime::from_unix_timestamp(*seconds as i64)
+                .ok()
+                .and_then(|dt| dt.format(&Rfc3339).ok())
+                .unwrap_or_else(|| format!("{seconds} seconds since Epoch"));
+            writeln!(f, "created: {created_str}")?;
         }
         if let Some(text) = &self.comment {
             writeln!(f, "comment: {text}")?;
@@ -130,9 +136,12 @@ impl fmt::Display for TorrentFile {
         if let Some(e) = &self.encoding {
             writeln!(f, "encoding: {e}")?;
         }
-        writeln!(f, "private: {}", self.private)?;
+        writeln!(f, "private?: {}", self.private)?;
         writeln!(f, "num hashes: {}", self.piece_hashes.len())?;
-        writeln!(f, "size: {} bytes ({} pieces of {} bytes each)", self.total_num_bytes, self.num_pieces, self.num_bytes_per_piece)?;
+        writeln!(f, "total size: {} ({} pieces of {} each)",
+            to_human_bytes(self.total_num_bytes),
+            self.num_pieces,
+            to_human_bytes(self.num_bytes_per_piece))?;
         writeln!(f, "file(s): {}", self.info)
     }
 }

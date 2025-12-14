@@ -11,6 +11,7 @@ use crate::peer::downloader::{FileDownloadInfo, FileDownloadState, Downloader};
 use tokio::sync::Mutex;
 use thiserror::Error;
 use indicatif::{ProgressBar, ProgressStyle};
+use tracing::{info, error};
 
 #[derive(Debug, Error)]
 pub enum PeerError {
@@ -173,7 +174,8 @@ pub async fn download(
         let state_clone = state_arc.clone();        
         let dir_clone = dir_arc.clone();
         let pb_clone = pb.clone();
-        // log("spawning task to download '{}' from {}", &file.filename, peer_clone);
+        
+        info!("spawning task to collaboratively download '{}' from {}", &file.filename, peer_clone);
 
         tasks.push(tokio::spawn(async move {
             let mut downloader = Downloader::new(
@@ -189,12 +191,13 @@ pub async fn download(
 
     for (i, task) in tasks.into_iter().enumerate() {
         match task.await {
-            Ok(Ok(())) => (),
-            Ok(Err(e)) => (), // log("[{}]: error with task: {:?}", peers[i], e),
-            Err(e) => () // log("[{}]: error with join: {:?}", peers[i], e),
+            Ok(Ok(())) => info!("... exiting"),
+            Ok(Err(e)) => error!("peer {} took error {:?}", peers[i], e),
+            Err(e) => error!("peer {} took error {:?}", peers[i], e),
         }
     }
 
+    info!("download of {} complete", file.filename);
     pb.finish();
 
     Ok(())

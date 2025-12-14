@@ -3,6 +3,8 @@ use std::fmt;
 
 use thiserror::Error;
 
+use crate::util::to_string;
+
 #[derive(Debug)]
 pub enum BencodeValue {
     Integer(i64),
@@ -48,10 +50,7 @@ struct BencodeParser {
 }
 
 pub(crate) fn write_bytes(bytes: &[u8], f: &mut fmt::Formatter) -> fmt::Result {
-    for byte in bytes {
-        write!(f, "{:02X}", byte)?;
-    }
-    Ok(())
+    write!(f, "{}", to_string(bytes))
 }
 
 pub(crate) fn write_byte_string(bytes: &[u8], f: &mut fmt::Formatter) -> fmt::Result {

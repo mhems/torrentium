@@ -5,9 +5,11 @@ use std::path::{Path, PathBuf};
 use crate::metadata::file::{FileModeInfo, TorrentFile};
 use crate::piece_filename;
 use crate::util::md5::md5_hash;
+use crate::util::to_string;
 
 use indicatif::ProgressIterator;
 use thiserror::Error;
+use tracing::{info, error};
 
 #[derive(Debug, Error)]
 pub enum FileError {
@@ -90,9 +92,11 @@ fn open_pieces_stream(piece_paths: &[PathBuf]) -> Result<Box<dyn Read>, FileErro
 }
 
 fn reconstitute_files(infos: &[FileInfo], piece_paths: &[PathBuf]) -> Result<(), FileError> {
+    info!("converting {} pieces into {} file(s)...", piece_paths.len(), infos.len());
+    
     let mut reader = open_pieces_stream(piece_paths)?;
 
-    for info in infos.iter().progress() {
+    for (i, info) in infos.iter().enumerate().progress() {
         if let Some(parent) = info.filepath.parent() {
             fs::create_dir_all(parent).map_err(FileError::FileSystemError)?
         }
@@ -107,6 +111,8 @@ fn reconstitute_files(infos: &[FileInfo], piece_paths: &[PathBuf]) -> Result<(),
         }
 
         writer.flush().map_err(FileError::FileSystemError)?;
+
+        info!("file {} ({}/{}) written to disk", info.filepath.to_string_lossy(), i, infos.len());
     }
 
     Ok(())
@@ -116,19 +122,19 @@ fn verify_md5(info: &FileInfo) -> Result<(), FileError> {
     if let Some(expected_hash) = info.md5sum {
         let bytes = fs::read(&info.filepath).map_err(FileError::FileSystemError)?;
         let downloaded_hash = md5_hash(&bytes);
+        let path_str = info.filepath.to_string_lossy();
         return if downloaded_hash == expected_hash {
+            info!("md5 of file {} matches", path_str);
             Ok(())
         } else {
+            error!("md5 of file {} mis-matches: expected {}, observed {}",
+                path_str, to_string(&expected_hash), to_string(&downloaded_hash));
             Err(FileError::Md5Mismatch{
                 filename: info.filepath.to_string_lossy().into(),
-                expected: md5_to_string(&expected_hash),
-                received: md5_to_string(&downloaded_hash)})
+                expected: to_string(&expected_hash),
+                received: to_string(&downloaded_hash)})
         }
     }
 
     Ok(())
-}
-
-fn md5_to_string(hash: &[u8; 16]) -> String {
-    hash.iter().map(|&byte| format!("{:02x}", byte)).collect::<Vec<_>>().join("")
 }

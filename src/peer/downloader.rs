@@ -7,13 +7,15 @@ use tokio::net::TcpStream;
 use tokio::fs::File;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::Mutex;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use tracing::{info, error};
 
 use crate::metadata::file::TorrentFile;
 use crate::peer::{Bitfield, PeerError};
 use crate::peer::handshake::handshake;
 use crate::peer::message::Message;
 use crate::util::sha1::sha1_hash;
+use crate::util::to_string;
 
 const BLOCK_SIZE: u32 = 16 * 1024;
 
@@ -31,7 +33,6 @@ pub struct Downloader {
 
 #[derive(Debug, Clone)]
 pub struct FileDownloadInfo {
-    num_pieces: u64,
     bytes_per_piece: usize,
     piece_hashes: Vec<[u8; 20]>,
     hash: [u8; 20],
@@ -52,7 +53,6 @@ struct PieceDownloadProgress {
 impl From<&TorrentFile> for FileDownloadInfo {
     fn from(file: &TorrentFile) -> Self {
         FileDownloadInfo {
-            num_pieces: file.num_pieces as u64,
             bytes_per_piece: file.num_bytes_per_piece as usize,
             piece_hashes: file.piece_hashes.clone(),
             hash: file.hash.clone()
@@ -82,9 +82,12 @@ impl PieceDownloadProgress {
         PieceDownloadProgress { offset: 0, data: Vec::with_capacity(piece_size) }
     }
 
+    pub fn remaining(&self) -> u32 {
+        (self.data.capacity() as u32) - self.offset
+    }
+
     pub fn get_next_block_size(&self) -> u32 {
-        let remainder = (self.data.capacity() as u32) - self.offset;
-        remainder.min(BLOCK_SIZE)
+        self.remaining().min(BLOCK_SIZE)
     }
 
     pub fn complete(&self) -> bool {
@@ -121,9 +124,21 @@ impl Downloader {
                dir: Arc<PathBuf>,
                pb: ProgressBar
                ) -> std::io::Result<Self> {
+        info!("connecting to peer {} ...", address);
+        let connection = match TcpStream::connect(address).await {
+            Ok(c) => {
+                info!("connected to peer {}", address);
+                c
+            },
+            Err(e) => {
+                error!("error connecting to peer {}: {:?}", address, e);
+                return Err(e);
+            }
+        };
+
         Ok(Downloader {
             address,
-            connection: TcpStream::connect(address).await?,
+            connection,
             info,
             shared_state: state,
             skip_set: HashSet::new(),
@@ -138,13 +153,14 @@ impl Downloader {
     }
 
     pub async fn download_pieces(self: &mut Self) -> Result<(), PeerError> {
+        info!("reaching out to handshake with peer {} (info hash = {})", self.address, to_string(&self.info.hash));
         handshake(&self.address, &mut self.connection, &self.info.hash).await?;
-        // log("...handshaked with {}!", self.address);
 
         let num_pieces = self.info.piece_hashes.len();
         let bitfield_len = (num_pieces + 7) / 8;
         let empty = vec![0u8; bitfield_len];
 
+        info!("sending empty Bitfield message to peer {}", self.address);
         Message::send_bitfield(&mut self.connection, &empty).await?;
     
         self.state = State::Curious;
@@ -152,22 +168,23 @@ impl Downloader {
         loop {
             match self.state {
                 State::Curious => {
-                    // log("[{}]: waiting for BitField", self.address);
+                    info!("waiting for Bitfield response from peer {} ...", self.address);
                     let msg = self.get_message().await?;
                     if let Message::Bitfield { bitfield } = msg {
                         if bitfield.all() {
                             self.state = State::Interested;
                             Message::send_interested(&mut self.connection).await?;
-                            // log("[{}]: interest expressed", self.address);
+                            info!("peer {} is a seed; interest expressed", self.address);
                         } else {
                             self.state = State::NotInterested;
-                            // log("[{}]: not fully seeded, abandoning", self.address);
+                            info!("peer {} is not fully seeded; abandoning download", self.address);
                         }
                     }
                 },
                 State::Choked | State::Interested => {
                     let msg = self.get_message().await?;
                     if let Message::Unchoke = msg {
+                        info!("peer {} sent Unchoke", self.address);
                         self.state = State::Unchoked;
                     }
                 },
@@ -193,32 +210,40 @@ impl Downloader {
                 guard.todo.remove(&p);
                 p
             } else {
-                // log("[{}]: exhausted", self.address);
+                info!("peer {} exhausted all pieces; exiting...", self.address);
                 return Err(PeerError::Exhausted(self.address.to_string()));
             }
         };
 
-        let result = Downloader::download_piece(&mut self.connection, piece, self.info.bytes_per_piece).await;
+        info!("peer {} selected piece {}", self.address, piece);
+        let expected_hash = self.info.piece_hashes[piece as usize];
+        info!("download of piece {} from peer {} starting, expecting hash {}", piece, self.address, to_string(&expected_hash));
+        let result = Downloader::download_piece(&mut self.connection, piece, self.info.bytes_per_piece, &self.address).await;
 
         match result {
             Ok(data) => {
                 let data_hash = sha1_hash(&data);
-                if data_hash == self.info.piece_hashes[piece as usize] {
-                    Downloader::save_piece(&self.dir, piece, &data)
+                info!("peer {} retrieved piece {} with SHA1 hash {}", self.address, piece, to_string(&data_hash));
+                if data_hash == expected_hash {
+                    let path = self.dir.join(piece_filename!(piece));
+                    let path_str = path.to_string_lossy();
+                    info!("peer {} writing piece {} to {}...", self.address, piece, path_str);
+                    Downloader::save_piece(&path, &data)
                             .await
                             .map_err(|e| PeerError::DiskError(piece, e))?;
+                    info!("peer {} wrote piece {} to {}", self.address, piece, path_str);
                     let mut guard = self.shared_state.lock().await;
                     self.pb.inc(self.info.bytes_per_piece as u64);
                     guard.complete(piece);
                 } else {
-                    // log(">>>> [{}]: DOWNLOADED ALL OF PIECE {} BUT HASHES MIS-MATCH!", self.address, piece);
+                    error!("peer {} found hash of piece {} mismatches, adding piece to skip list and re-queueing for another peer", self.address, piece);
                     self.skip_set.insert(piece);
                     let mut guard = self.shared_state.lock().await;
                     guard.requeue(piece);
                 }
             },
             Err(e) => {
-                // log(">>>> [{}] took error {:?}", self.address, e);
+                error!("peer {} took error during download: {:?}", self.address, e);
                 self.skip_set.insert(piece);
                 let mut guard = self.shared_state.lock().await;
                 guard.requeue(piece);
@@ -228,37 +253,44 @@ impl Downloader {
         Ok(())
     }
 
-    async fn download_piece(stream: &mut TcpStream, piece: u32, length: usize) -> Result<Box<[u8]>, PeerError> {
+    async fn download_piece(stream: &mut TcpStream, piece: u32, length: usize, address: &SocketAddrV4) -> Result<Box<[u8]>, PeerError> {
         let mut progress = PieceDownloadProgress::new(length);
         let mut choked = false;
         let mut request_size = 0u32;
 
         while !progress.complete() {
-
             if !choked {
                 request_size = progress.get_next_block_size();
+                info!("asking for {} bytes at offset {} for piece {} from peer {} ({} bytes remain)", request_size, progress.offset, piece, address, progress.remaining());
                 Message::send_request(stream, piece, progress.offset, request_size).await?;
             }
 
             match Message::read_message(stream).await? {
                 Message::Piece { index, begin, bytes} => {
+                    info!("peer {} responsed with piece {} at offset {} with length {}", address, index, begin, bytes.len());
                     if index == piece && progress.offset == begin && bytes.len() as u32 == request_size {
                         progress.add_block(&bytes);
                     }
                 },
-                Message::Choke => choked = true,
-                Message::Unchoke => choked = false,
+                Message::Choke => {
+                    info!("peer {} sent choke", address);
+                    choked = true;
+                }
+                Message::Unchoke => {
+                    info!("peer {} sent unchoke", address);
+                    choked = false;
+                }
                 _ => (),
             }
         }
 
+        info!("finished download of piece {} from peer {}", piece, address);
+
         Ok(progress.data.into_boxed_slice())
     }
 
-    async fn save_piece(dir: &PathBuf, piece: u32, bytes: &[u8]) -> tokio::io::Result<()> {
-        let path = dir.join(piece_filename!(piece));
+    async fn save_piece(path: &Path, bytes: &[u8]) -> tokio::io::Result<()> {
         let mut file = File::create(path).await?;
-        file.write_all(bytes).await?;
-        Ok(())
+        file.write_all(bytes).await
     }
 }

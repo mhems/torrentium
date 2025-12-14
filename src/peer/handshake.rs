@@ -4,6 +4,7 @@ use std::result::Result;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
+use tracing::info;
 
 use crate::PEER_ID;
 use crate::metadata::bencode::{write_byte_string, write_bytes};
@@ -81,7 +82,7 @@ pub(crate) async fn handshake(address: &SocketAddrV4, stream: &mut TcpStream, in
     if mine.info_hash != theirs.info_hash {
         Err(PeerError::MismatchedHash(mine.info_hash, theirs.info_hash))
     } else {
-        // log("handshaked with {}", &theirs);
+        info!("shook hands with peer {} ({})", address, &theirs);
         Ok(())
     }
 }

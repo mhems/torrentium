@@ -1,4 +1,5 @@
 use std::path::Path;
+use tracing::info;
 
 use crate::metadata::file::TorrentFile;
 
@@ -19,6 +20,8 @@ pub fn parse_torrent<P: AsRef<Path>>(path: P) -> std::result::Result<TorrentFile
 
 pub async fn download_torrent<P: AsRef<Path>>(path: P) -> std::result::Result<(), Box<dyn std::error::Error>> {
     let torrent_file: TorrentFile = parse_torrent(path)?;
+    info!("torrent: {}", torrent_file);
     let response = torrent_file.retrieve_peers().await?;
+    info!("{} peers available to download {}", response.peers.len(), torrent_file.filename);
     torrent_file.download(&response.peers).await
 }

@@ -4,6 +4,10 @@ pub mod io;
 pub mod sha1;
 pub mod md5;
 
+pub fn to_string(bytes: &[u8]) -> String {
+     bytes.iter().map(|&byte| format!("{:02x}", byte)).collect::<Vec<_>>().join("")
+}
+
 fn pad_bytes(bytes: &[u8], big_endian: bool) -> Vec<u8> {
     let n = bytes.len() as u64;
     let message_length: u64 = n * 8;

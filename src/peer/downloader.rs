@@ -29,6 +29,7 @@ pub struct Downloader {
     state: State,
     dir: Arc<PathBuf>,
     pb: ProgressBar,
+    progress: PieceDownloadProgress,
 }
 
 #[derive(Debug, Clone)]
@@ -87,6 +88,11 @@ impl PieceDownloadProgress {
         self.length - self.offset
     }
 
+    fn reset(&mut self) {
+        self.offset = 0;
+        self.data.clear();
+    }
+
     pub fn get_next_block_size(&self) -> u32 {
         self.remaining().min(BLOCK_SIZE)
     }
@@ -138,6 +144,7 @@ impl Downloader {
             }
         };
 
+        let piece_size = info.bytes_per_piece;
         Ok(Downloader {
             address,
             connection,
@@ -146,7 +153,8 @@ impl Downloader {
             skip_set: HashSet::new(),
             state: State::Curious,
             dir,
-            pb
+            pb,
+            progress: PieceDownloadProgress::new(piece_size),
         })
     }
 
@@ -222,77 +230,81 @@ impl Downloader {
         info!("peer {} selected piece {}", self.address, piece);
         let expected_hash = self.info.piece_hashes[piece as usize];
         info!("download of piece {} from peer {} starting, expecting hash {}", piece, self.address, to_string(&expected_hash));
-        let result = Downloader::download_piece(&mut self.connection, piece, self.info.bytes_per_piece, &self.address).await;
-
-        match result {
-            Ok(data) => {
-                let data_hash = sha1_hash(&data);
-                info!("peer {} retrieved piece {} with SHA1 hash {}", self.address, piece, to_string(&data_hash));
-                if data_hash == expected_hash {
-                    let path = self.dir.join(piece_filename!(piece));
-                    let path_str = path.to_string_lossy();
-                    info!("peer {} writing piece {} to {}...", self.address, piece, path_str);
-                    Downloader::save_piece(&path, &data)
-                            .await
-                            .map_err(|e| PeerError::DiskError(piece, e))?;
-                    info!("peer {} wrote piece {} to {}", self.address, piece, path_str);
-                    let mut guard = self.shared_state.lock().await;
-                    self.pb.inc(self.info.bytes_per_piece as u64);
-                    guard.complete(piece);
-                } else {
-                    error!("peer {} found hash of piece {} mismatches, adding piece to skip list and re-queueing for another peer", self.address, piece);
-                    self.skip_set.insert(piece);
-                    let mut guard = self.shared_state.lock().await;
-                    guard.requeue(piece);
-                }
-            },
-            Err(e) => {
-                error!("peer {} took error during download: {:?}", self.address, e);
-                self.skip_set.insert(piece);
-                let mut guard = self.shared_state.lock().await;
-                guard.requeue(piece);
-                self.state = State::Choked;
-            }
+        let result = self.download_piece(piece, &expected_hash).await;
+        
+        if let Err(e) = &result {
+            error!("peer {} took error during download: {:?}", self.address, e);
+            self.skip_set.insert(piece);
+            let mut guard = self.shared_state.lock().await;
+            guard.requeue(piece);
+            self.state = State::Choked;
+            return Err(PeerError::Exhausted(self.address.to_string()));
         }
         Ok(())
     }
 
-    async fn download_piece(stream: &mut TcpStream, piece: u32, length: usize, address: &SocketAddrV4) -> Result<Box<[u8]>, PeerError> {
-        let mut progress = PieceDownloadProgress::new(length);
+    async fn download_piece(&mut self, piece: u32, expected_hash: &[u8; 20]) -> Result<(), PeerError> {
         let mut choked = false;
         let mut request_size = 0u32;
 
-        while !progress.complete() {
+        self.progress.reset();
+
+        while !self.progress.complete() {
             if !choked {
-                request_size = progress.get_next_block_size();
-                info!("asking for {} bytes at offset {} for piece {} from peer {} ({} bytes remain)", request_size, progress.offset, piece, address, progress.remaining());
+                request_size = self.progress.get_next_block_size();
+                info!("asking for {} bytes at offset {} for piece {} from peer {} ({} bytes remain)",
+                    request_size, self.progress.offset, piece, self.address, self.progress.remaining());
                 
                 // TODO improve upon lock-step by priming up to 5 requests at a given time
-                Message::send_request(stream, piece, progress.offset, request_size).await?;
+                Message::send_request(&mut self.connection, piece, self.progress.offset, request_size).await?;
             }
 
-            match Message::read_message(stream).await? {
+            match Message::read_message(&mut self.connection).await? {
                 Message::Piece { index, begin, bytes} => {
-                    info!("peer {} responded with piece {} at offset {} with length {}", address, index, begin, bytes.len());
-                    if index == piece && progress.offset == begin && bytes.len() as u32 == request_size {
-                        progress.add_block(bytes);
+                    info!("peer {} responded with piece {} at offset {} with length {}", self.address, index, begin, bytes.len());
+                    if index == piece && self.progress.offset == begin && bytes.len() as u32 == request_size {
+                        self.progress.add_block(bytes);
                     }
                 },
                 Message::Choke => {
-                    info!("peer {} sent choke", address);
+                    info!("peer {} sent choke", self.address);
                     choked = true;
                 }
                 Message::Unchoke => {
-                    info!("peer {} sent unchoke", address);
+                    info!("peer {} sent unchoke", self.address);
                     choked = false;
                 }
                 _ => (),
             }
         }
 
-        info!("finished download of piece {} from peer {}", piece, address);
+        info!("finished download of piece {} from peer {}", piece, self.address);
 
-        Ok(progress.data.into_boxed_slice())
+        self.verify_and_save_piece(piece, expected_hash).await
+    }
+
+    async fn verify_and_save_piece(&mut self, piece: u32, expected_hash: &[u8; 20]) -> Result<(), PeerError> {
+        let data_hash = sha1_hash(&self.progress.data);
+        info!("peer {} retrieved piece {} with SHA1 hash {}", self.address, piece, to_string(&data_hash));
+        if data_hash == *expected_hash {
+            let path = self.dir.join(piece_filename!(piece));
+            let path_str = path.to_string_lossy();
+            info!("peer {} writing piece {} to {}...", self.address, piece, path_str);
+            Downloader::save_piece(&path, &self.progress.data)
+                    .await
+                    .map_err(|e| PeerError::DiskError(piece, e))?;
+            info!("peer {} wrote piece {} to {}", self.address, piece, path_str);
+            let mut guard = self.shared_state.lock().await;
+            self.pb.inc(self.info.bytes_per_piece as u64);
+            guard.complete(piece);
+            Ok(())
+        } else {
+            error!("peer {} found hash of piece {} mismatches, adding piece to skip list and re-queueing for another peer", self.address, piece);
+            self.skip_set.insert(piece);
+            let mut guard = self.shared_state.lock().await;
+            guard.requeue(piece);
+            Err(PeerError::Exhausted(self.address.to_string()))
+        }
     }
 
     async fn save_piece(path: &Path, bytes: &[u8]) -> tokio::io::Result<()> {

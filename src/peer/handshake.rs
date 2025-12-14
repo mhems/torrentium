@@ -81,7 +81,7 @@ pub(crate) async fn handshake(address: &SocketAddrV4, stream: &mut TcpStream, in
     if mine.info_hash != theirs.info_hash {
         Err(PeerError::MismatchedHash(mine.info_hash, theirs.info_hash))
     } else {
-        println!("handshaked with {}", &theirs);
+        // log("handshaked with {}", &theirs);
         Ok(())
     }
 }

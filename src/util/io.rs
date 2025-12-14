@@ -6,6 +6,7 @@ use crate::metadata::file::{FileModeInfo, TorrentFile};
 use crate::piece_filename;
 use crate::util::md5::md5_hash;
 
+use indicatif::ProgressIterator;
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -91,7 +92,7 @@ fn open_pieces_stream(piece_paths: &[PathBuf]) -> Result<Box<dyn Read>, FileErro
 fn reconstitute_files(infos: &[FileInfo], piece_paths: &[PathBuf]) -> Result<(), FileError> {
     let mut reader = open_pieces_stream(piece_paths)?;
 
-    for info in infos {
+    for info in infos.iter().progress() {
         if let Some(parent) = info.filepath.parent() {
             fs::create_dir_all(parent).map_err(FileError::FileSystemError)?
         }

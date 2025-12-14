@@ -2,6 +2,7 @@ use std::collections::HashSet;
 use std::net::SocketAddrV4;
 use std::sync::Arc;
 
+use indicatif::ProgressBar;
 use tokio::net::TcpStream;
 use tokio::fs::File;
 use tokio::io::AsyncWriteExt;
@@ -25,6 +26,7 @@ pub struct Downloader {
     skip_set: HashSet<u32>,
     state: State,
     dir: Arc<PathBuf>,
+    pb: ProgressBar,
 }
 
 #[derive(Debug, Clone)]
@@ -117,6 +119,7 @@ impl Downloader {
                info: Arc<FileDownloadInfo>,
                state: Arc<Mutex<FileDownloadState>>,
                dir: Arc<PathBuf>,
+               pb: ProgressBar
                ) -> std::io::Result<Self> {
         Ok(Downloader {
             address,
@@ -125,7 +128,8 @@ impl Downloader {
             shared_state: state,
             skip_set: HashSet::new(),
             state: State::Curious,
-            dir
+            dir,
+            pb
         })
     }
 
@@ -135,7 +139,7 @@ impl Downloader {
 
     pub async fn download_pieces(self: &mut Self) -> Result<(), PeerError> {
         handshake(&self.address, &mut self.connection, &self.info.hash).await?;
-        println!("...handshaked with {}!", self.address);
+        // log("...handshaked with {}!", self.address);
 
         let num_pieces = self.info.piece_hashes.len();
         let bitfield_len = (num_pieces + 7) / 8;
@@ -148,16 +152,16 @@ impl Downloader {
         loop {
             match self.state {
                 State::Curious => {
-                    println!("[{}]: waiting for BitField", self.address);
+                    // log("[{}]: waiting for BitField", self.address);
                     let msg = self.get_message().await?;
                     if let Message::Bitfield { bitfield } = msg {
                         if bitfield.all() {
                             self.state = State::Interested;
                             Message::send_interested(&mut self.connection).await?;
-                            println!("[{}]: interest expressed", self.address);
+                            // log("[{}]: interest expressed", self.address);
                         } else {
                             self.state = State::NotInterested;
-                            println!("[{}]: not fully seeded, abandoning", self.address);
+                            // log("[{}]: not fully seeded, abandoning", self.address);
                         }
                     }
                 },
@@ -184,13 +188,12 @@ impl Downloader {
     async fn try_download_piece(&mut self) -> Result<(), PeerError> {
         let piece = {
             let mut guard = self.shared_state.lock().await;
-            println!("[{}]: {:.4}% to go", self.address, (guard.todo.len() as f32) * 100.0 / (self.info.num_pieces as f32));
 
             if let Some(&p) = guard.todo.iter().find(|&&p| !self.skip_set.contains(&p)) {
                 guard.todo.remove(&p);
                 p
             } else {
-                println!("[{}]: exhausted", self.address);
+                // log("[{}]: exhausted", self.address);
                 return Err(PeerError::Exhausted(self.address.to_string()));
             }
         };
@@ -205,16 +208,17 @@ impl Downloader {
                             .await
                             .map_err(|e| PeerError::DiskError(piece, e))?;
                     let mut guard = self.shared_state.lock().await;
+                    self.pb.inc(self.info.bytes_per_piece as u64);
                     guard.complete(piece);
                 } else {
-                    println!(">>>> [{}]: DOWNLOADED ALL OF PIECE {} BUT HASHES MIS-MATCH!", self.address, piece);
+                    // log(">>>> [{}]: DOWNLOADED ALL OF PIECE {} BUT HASHES MIS-MATCH!", self.address, piece);
                     self.skip_set.insert(piece);
                     let mut guard = self.shared_state.lock().await;
                     guard.requeue(piece);
                 }
             },
             Err(e) => {
-                println!(">>>> [{}] took error {:?}", self.address, e);
+                // log(">>>> [{}] took error {:?}", self.address, e);
                 self.skip_set.insert(piece);
                 let mut guard = self.shared_state.lock().await;
                 guard.requeue(piece);

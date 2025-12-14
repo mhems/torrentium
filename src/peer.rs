@@ -10,6 +10,7 @@ use crate::peer::downloader::{FileDownloadInfo, FileDownloadState, Downloader};
 
 use tokio::sync::Mutex;
 use thiserror::Error;
+use indicatif::{ProgressBar, ProgressStyle};
 
 #[derive(Debug, Error)]
 pub enum PeerError {
@@ -158,20 +159,29 @@ pub async fn download(
     let state = FileDownloadState::new(file.num_pieces);
     let state_arc = Arc::new(Mutex::new(state));
 
+    let pb = ProgressBar::new(file.total_num_bytes as u64);
+
+    pb.set_style(
+        ProgressStyle::default_bar()
+            .template("[{elapsed_precise}] (ETA: {eta}) [{bar:40.cyan/blue}] ({percent}%) {bytes}/{total_bytes} ({bytes_per_sec})")
+            .unwrap(),
+    );
+
     for i in 0..peers.len() {
         let peer_clone = peers[i].clone();
         let info_clone = info_arc.clone();
         let state_clone = state_arc.clone();        
         let dir_clone = dir_arc.clone();
-
-        println!("spawning task to download '{}' from {}", &file.filename, peer_clone);
+        let pb_clone = pb.clone();
+        // log("spawning task to download '{}' from {}", &file.filename, peer_clone);
 
         tasks.push(tokio::spawn(async move {
             let mut downloader = Downloader::new(
                 peer_clone,
                 info_clone,
                 state_clone,
-                dir_clone
+                dir_clone,
+                pb_clone
             ).await.map_err(|e| PeerError::ConnectionError(peer_clone.to_string(), e))?;
             downloader.download_pieces().await
         }));
@@ -180,10 +190,12 @@ pub async fn download(
     for (i, task) in tasks.into_iter().enumerate() {
         match task.await {
             Ok(Ok(())) => (),
-            Ok(Err(e)) => println!("[{}]: error with task: {:?}", peers[i], e),
-            Err(e) => println!("[{}]: error with join: {:?}", peers[i], e),
+            Ok(Err(e)) => (), // log("[{}]: error with task: {:?}", peers[i], e),
+            Err(e) => () // log("[{}]: error with join: {:?}", peers[i], e),
         }
     }
+
+    pb.finish();
 
     Ok(())
 }

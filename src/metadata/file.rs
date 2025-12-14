@@ -21,6 +21,7 @@ pub struct TorrentFile {
     comment: Option<String>,
     created_by: Option<String>,
     encoding: Option<String>,
+    private: bool,
 
     pub info: FileModeInfo,
     pub total_num_bytes: u64,
@@ -28,7 +29,6 @@ pub struct TorrentFile {
     pub num_pieces: usize,
     pub piece_hashes: Vec<[u8; 20]>,
     pub hash: [u8; 20],
-    private: bool,
 
     pub filename: String,
 }
@@ -84,7 +84,7 @@ pub enum TorrentFileError {
     InvalidString(Vec<u8>),
     #[error("unable to parse `announce` URL '{0}'")]
     InvalidAnnounceUrl(String),
-    #[error("length inferred from number of pieces and piece size ({0}) does not equal lengths of file(s) ({1})")]
+    #[error("file length totals {0} do not align with piece totals {1}")]
     LengthMismatch(u64, u64),
 }
 
@@ -186,7 +186,7 @@ impl TorrentFile {
     pub async fn download(self: &Self, peers: &Vec<SocketAddrV4>) -> std::result::Result<(), Box<dyn std::error::Error>> {
         let dir = tempfile::TempDir::new().expect("should be able to construct temporary directory");
         let dir_path = dir.path();
-        println!("temp dir is {}", dir_path.to_string_lossy());
+
         download(&peers, self, &dir_path).await?;
 
         reconstitute_files_from_torrent(&self, &dir_path).map_err(|e| e.into())
@@ -222,16 +222,12 @@ impl TorrentFile {
         };
         let piece_hashes = Self::extract_pieces(info_items.get(PIECES))?;
         let num_pieces = piece_hashes.len();
-        let total_num_bytes = num_pieces as u64 * num_bytes_per_piece;
         let hash = sha1_hash(Vec::from(items.get(INFO).unwrap()).as_slice());
         let name = Self::extract_string(info_items.get(NAME), "name", true)?.unwrap();
-        let info = if !info_items.contains_key(FILES) {
+        let (info, total_num_bytes) = if !info_items.contains_key(FILES) {
             let length = Self::extract_uint(info_items.get(LENGTH), "length", true)?.unwrap();
-            if length != total_num_bytes {
-                return Err(TorrentFileError::LengthMismatch(length, total_num_bytes))
-            }
             let md5sum = Self::extract_md5sum(info_items.get(MD5SUM))?;
-            FileModeInfo::Single { filename: name, length: length, md5sum: md5sum }
+            (FileModeInfo::Single { filename: name, length: length, md5sum: md5sum }, length)
         } else {
             let mut files = Vec::new();
             let mut length: u64 = 0;
@@ -258,11 +254,16 @@ impl TorrentFile {
             if files.is_empty() {
                 return Err(TorrentFileError::KeyMapsToAnEmptyList("files"))
             }
-            if length != total_num_bytes {
-                return Err(TorrentFileError::LengthMismatch(length, total_num_bytes))
-            }
-            FileModeInfo::Multiple { directory: name, files: files }
+            (FileModeInfo::Multiple { directory: name, files: files }, length)
         };
+
+        let np = num_pieces as u64;
+        let upper_bound = num_bytes_per_piece * np;
+        if num_bytes_per_piece * (np - 1) >= total_num_bytes ||
+           total_num_bytes > upper_bound {
+            return Err(TorrentFileError::LengthMismatch(total_num_bytes, upper_bound));
+        }
+
         Ok(TorrentFile {
             announce,
             announce_list,
